@@ -1,0 +1,4352 @@
+from __future__ import annotations
+
+from datetime import date
+from typing import List, Optional, Tuple
+
+from sqlalchemy.orm import Session
+
+from models import AcademicSession, Class, Section, Student, Subject, SubjectClassMapping, SubjectSectionMapping, ExamType, Marks, MarksAuditLog, MarksDraft, User, UserClassSubjectMapping, ExamComponent, ComponentMarks
+from repositories import ClassRepository, SectionRepository, SessionRepository, StudentRepository, SubjectRepository, ExamTypeRepository, MarksRepository, MarksAuditLogRepository, MarksDraftRepository, UserRepository, UserClassSubjectMappingRepository, ExamComponentRepository, ComponentMarksRepository
+
+
+class SessionService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = SessionRepository(session)
+
+    def set_current(self, session_id: int) -> AcademicSession:
+        item = self.repo.get(session_id)
+        if item is None:
+            raise ValueError("Session not found")
+        try:
+            current = self.repo.current()
+            if current is not None and current.id != session_id:
+                current.is_current = False
+            item.is_current = True
+            item.status = "active"
+            self._ensure_one_current()
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def archive_session(self, session_id: int) -> AcademicSession:
+        item = self.repo.get(session_id)
+        if item is None:
+            raise ValueError("Session not found")
+        if item.is_current:
+            raise ValueError("Cannot archive the current session")
+        try:
+            item.status = "archived"
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            return item
+
+    def update_session(
+        self,
+        session_id: int,
+        name: Optional[str] = None,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        status: Optional[str] = None,
+    ) -> AcademicSession:
+        item = self.repo.get(session_id)
+        if item is None:
+            raise ValueError("Session not found")
+        proposed_name = item.name
+        proposed_start = item.start_date
+        proposed_end = item.end_date
+        proposed_status = item.status
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Session name is required")
+            existing = self.repo.get_by_name(name)
+            if existing is not None and existing.id != session_id:
+                raise ValueError(f"Session '{name}' already exists")
+            proposed_name = name
+        if start_date is not None:
+            proposed_start = start_date
+        if end_date is not None:
+            proposed_end = end_date
+        if proposed_end < proposed_start:
+            raise ValueError("End date must be on or after start date")
+        if status is not None:
+            if status not in ("active", "archived"):
+                raise ValueError("Status must be 'active' or 'archived'")
+            proposed_status = status
+        try:
+            item.name = proposed_name
+            item.start_date = proposed_start
+            item.end_date = proposed_end
+            item.status = proposed_status
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def delete_session(self, session_id: int) -> None:
+        item = self.repo.get(session_id)
+        if item is None:
+            raise ValueError("Session not found")
+        if self.repo.has_records(session_id):
+            raise ValueError("Cannot delete a session referenced by academic records")
+        try:
+            self.repo.delete(item)
+            self._ensure_one_current()
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    # ------------------------------------------------------------------ reads
+
+    def list_sessions(self) -> List[AcademicSession]:
+        return self.repo.list_all()
+
+    def get_session(self, session_id: int) -> Optional[AcademicSession]:
+        return self.repo.get(session_id)
+
+    # ------------------------------------------------------------------ invariant
+
+    def _ensure_one_current(self) -> None:
+        """Guarantee exactly one current session whenever sessions exist.
+
+        Runs inside the same transaction as the mutating operation so the
+        outcome is atomic.
+        """
+        sessions = self.repo.list_all()
+        if not sessions:
+            return
+        if self.repo.current() is None:
+            sessions[0].is_current = True
+
+    def _initialize_session_exam_config(self, session_id: int) -> None:
+        """Idempotently initialize standard exam types and component configurations
+        for a new academic session. Preserves existing customizations.
+        """
+        from models import Subject
+        
+        # Get standard exam types (create if missing)
+        exam_type_configs = [
+            ("PT1", "PTI", "Periodic Test 1", 25, 1.0, 1),
+            ("PT2", "PT2", "Periodic Test 2", 25, 1.0, 2),
+            ("Half Yearly", "HY", "Half Yearly Examination", 100, 0.5, 3),
+            ("Annual", "ANN", "Annual Examination", 100, 1.0, 4),
+        ]
+        
+        exam_type_ids = {}
+        for name, code, desc, max_marks, weightage, display_order in exam_type_configs:
+            exam_type = self.repo.session.query(ExamType).filter_by(name=name).first()
+            if not exam_type:
+                exam_type = ExamType(
+                    name=name,
+                    code=code,
+                    description=desc,
+                    max_marks=max_marks,
+                    weightage=weightage,
+                    display_order=display_order,
+                    is_active=True,
+                )
+                self.repo.session.add(exam_type)
+                self.repo.session.flush()
+            exam_type_ids[name] = exam_type.id
+
+        # Get all subjects
+        subjects = self.repo.session.query(Subject).filter_by(is_active=True).all()
+        if not subjects:
+            return  # No subjects to configure
+
+        # Define component configurations per subject category
+        core_subjects = {"ENGLISH", "MATHS", "HINDI", "SCIENCE", "SOCIAL SCIENCE"}
+        computer_subjects = {"COMPUTER", "COMPUTER SCIENCE"}
+        french_subjects = {"FRENCH"}
+        gk_subjects = {"GK", "GENERAL KNOWLEDGE"}
+
+        # Component configurations: (name, code, max_marks, display_order)
+        hy_core = [
+            ("Periodic Test 1", "PT1", 5, 1),
+            ("Multiple Assessment", "MA", 5, 2),
+            ("Subject Enrichment", "SE", 5, 3),
+            ("Portfolio", "PF", 5, 4),
+            ("Written Exam", "WE", 80, 5),
+        ]
+        ann_core = [
+            ("Periodic Test 2", "PT2", 5, 1),
+            ("Multiple Assessment", "MA", 5, 2),
+            ("Subject Enrichment", "SE", 5, 3),
+            ("Portfolio", "PF", 5, 4),
+            ("Written Exam", "WE", 80, 5),
+        ]
+        hy_computer = [
+            ("Periodic Test 1", "PT1", 5, 1),
+            ("Practical", "PRAC", 30, 2),
+            ("Theory", "THEORY", 50, 3),
+            ("Multiple Assessment", "MA", 5, 4),
+            ("Enrichment", "ENR", 5, 5),
+            ("Portfolio", "PF", 5, 6),
+        ]
+        ann_computer = [
+            ("Periodic Test 2", "PT2", 5, 1),
+            ("Practical", "PRAC", 30, 2),
+            ("Theory", "THEORY", 50, 3),
+            ("Multiple Assessment", "MA", 5, 4),
+            ("Enrichment", "ENR", 5, 5),
+            ("Portfolio", "PF", 5, 6),
+        ]
+        hy_french = [
+            ("Periodic Test 1", "PT1", 5, 1),
+            ("Written Exam", "WE", 80, 2),
+            ("Multiple Assessment", "MA", 5, 3),
+            ("Enrichment", "ENR", 5, 4),
+            ("Portfolio", "PF", 5, 5),
+        ]
+        ann_french = [
+            ("Periodic Test 2", "PT2", 5, 1),
+            ("Written Exam", "WE", 80, 2),
+            ("Multiple Assessment", "MA", 5, 3),
+            ("Enrichment", "ENR", 5, 4),
+            ("Portfolio", "PF", 5, 5),
+        ]
+        hy_gk = [
+            ("PT Paper", "PT", 25, 1),
+            ("Term Paper", "TP", 40, 2),
+        ]
+        ann_gk = [
+            ("PT Paper", "PT", 25, 1),
+            ("Term Paper", "TP", 40, 2),
+        ]
+        pt1_core = [("Periodic Test 1", "PT1", 25, 1)]
+        pt1_computer = [("Periodic Test 1", "PT1", 25, 1)]
+        pt1_french = [("Periodic Test 1", "PT1", 25, 1)]
+        pt1_gk = [("PT Paper", "PT", 25, 1)]
+        pt2_core = [("Periodic Test 2", "PT2", 25, 1)]
+        pt2_computer = [("Periodic Test 2", "PT2", 25, 1)]
+        pt2_french = [("Periodic Test 2", "PT2", 25, 1)]
+        pt2_gk = [("PT Paper", "PT", 25, 1)]
+
+        # Build component configurations by subject name
+        subject_configs = {}
+        for subject in subjects:
+            name = subject.name.upper()
+            if name in core_subjects:
+                subject_configs[subject.id] = {
+                    "PT1": pt1_core,
+                    "PT2": pt2_core,
+                    "Half Yearly": hy_core,
+                    "Annual": ann_core,
+                }
+            elif name in computer_subjects:
+                subject_configs[subject.id] = {
+                    "PT1": pt1_computer,
+                    "PT2": pt2_computer,
+                    "Half Yearly": hy_computer,
+                    "Annual": ann_computer,
+                }
+            elif name in french_subjects:
+                subject_configs[subject.id] = {
+                    "PT1": pt1_french,
+                    "PT2": pt2_french,
+                    "Half Yearly": hy_french,
+                    "Annual": ann_french,
+                }
+            elif name in gk_subjects:
+                subject_configs[subject.id] = {
+                    "PT1": pt1_gk,
+                    "PT2": pt2_gk,
+                    "Half Yearly": hy_gk,
+                    "Annual": ann_gk,
+                }
+            else:
+                # Default to core config
+                subject_configs[subject.id] = {
+                    "PT1": pt1_core,
+                    "PT2": pt2_core,
+                    "Half Yearly": hy_core,
+                    "Annual": ann_core,
+                }
+
+        # Idempotently add components for each subject
+        for subject_id, configs in subject_configs.items():
+            for exam_name, components in configs.items():
+                exam_type_id = exam_type_ids.get(exam_name)
+                if not exam_type_id:
+                    continue
+                for name, code, max_marks, display_order in components:
+                    # Check if component already exists
+                    existing = self.repo.session.query(ExamComponent).filter_by(
+                        exam_type_id=exam_type_id,
+                        subject_id=subject_id,
+                        name=name
+                    ).first()
+                    if not existing:
+                        component = ExamComponent(
+                            exam_type_id=exam_type_id,
+                            subject_id=subject_id,
+                            name=name,
+                            code=code,
+                            max_marks=max_marks,
+                            display_order=display_order,
+                            is_active=True,
+                        )
+                        self.repo.session.add(component)
+
+    def add_session(
+        self,
+        name: str,
+        start_date: date,
+        end_date: date,
+        status: str = "active",
+        is_current: bool = False,
+    ) -> AcademicSession:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Session name is required")
+        if self.repo.get_by_name(name):
+            raise ValueError(f"Session '{name}' already exists")
+        if end_date < start_date:
+            raise ValueError("End date must be on or after start date")
+        if status not in ("active", "archived"):
+            raise ValueError("Status must be 'active' or 'archived'")
+        if is_current:
+            current = self.repo.current()
+            if current:
+                current.is_current = False
+        item = AcademicSession(
+            name=name,
+            start_date=start_date,
+            end_date=end_date,
+            status=status,
+            is_current=is_current,
+        )
+        try:
+            self.repo.add(item)
+            self._initialize_session_exam_config(item.id)
+            self._ensure_one_current()
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+
+# ========================================================================
+# ClassService
+# ========================================================================
+
+class ClassService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = ClassRepository(session)
+
+    # ------------------------------------------------------------------ writes
+
+    def add_class(
+        self,
+        name: str,
+        display_order: Optional[int] = None,
+        is_active: bool = True,
+    ) -> Class:
+            name = (name or "").strip()
+            if not name:
+                raise ValueError("Class name is required")
+            if self.repo.exists_by_name(name):
+                raise ValueError(f"Class '{name}' already exists")
+            if display_order is None:
+                display_order = self.repo.get_max_display_order() + 1
+            if display_order < 0:
+                raise ValueError("Display order must be non-negative")
+            item = Class(name=name, display_order=display_order, is_active=is_active)
+            try:
+                self.repo.add(item)
+                self.session.commit()
+            except Exception:
+                self.session.rollback()
+                raise
+            return item
+
+    def deactivate_class(self, class_id: int) -> Class:
+        item = self.repo.get(class_id)
+        if item is None:
+            raise ValueError("Class not found")
+        if not item.is_active:
+            return item
+        # Check if any active sections exist in this class
+        from repositories import SectionRepository
+        section_repo = SectionRepository(self.session)
+        active_sections = section_repo.list_active_by_class(class_id)
+        if active_sections:
+            raise ValueError(f"Cannot deactivate class: {len(active_sections)} active section(s) exist")
+        try:
+            item.is_active = False
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def activate_class(self, class_id: int) -> Class:
+        item = self.repo.get(class_id)
+        if item is None:
+            raise ValueError("Class not found")
+        if item.is_active:
+            return item
+        try:
+            item.is_active = True
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_class(
+        self,
+        class_id: int,
+        name: Optional[str] = None,
+        display_order: Optional[int] = None,
+        is_active: Optional[bool] = None,
+    ) -> Class:
+        item = self.repo.get(class_id)
+        if item is None:
+            raise ValueError("Class not found")
+        proposed_name = item.name
+        proposed_order = item.display_order
+        proposed_active = item.is_active
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Class name is required")
+            if self.repo.exists_by_name(name, exclude_id=class_id):
+                raise ValueError(f"Class '{name}' already exists")
+            proposed_name = name
+        if display_order is not None:
+            if display_order < 0:
+                raise ValueError("Display order must be non-negative")
+            proposed_order = display_order
+        if is_active is not None:
+            proposed_active = is_active
+        try:
+            item.name = proposed_name
+            item.display_order = proposed_order
+            item.is_active = proposed_active
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def reorder_classes(self, class_orders: List[Tuple[int, int]]) -> None:
+        """Reorder classes by setting new display_order for each class_id.
+
+        class_orders: list of (class_id, new_display_order)
+        """
+        try:
+            for class_id, new_order in class_orders:
+                if new_order < 0:
+                    raise ValueError("Display order must be non-negative")
+                item = self.repo.get(class_id)
+                if item is None:
+                    raise ValueError(f"Class {class_id} not found")
+                item.display_order = new_order
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def bulk_import(
+        self,
+        names: List[str],
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[Class], List[str]]:
+        """Import multiple classes from a list of names.
+
+        Returns (created_classes, errors).
+        """
+        created = []
+        errors = []
+        for name in names:
+            name = name.strip()
+            if not name:
+                errors.append("Empty name skipped")
+                continue
+            if self.repo.exists_by_name(name):
+                if skip_duplicates:
+                    errors.append(f"Duplicate skipped: {name}")
+                    continue
+                else:
+                    errors.append(f"Duplicate: {name}")
+                    continue
+            try:
+                cls = self.add_class(name)
+                created.append(cls)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        return created, errors
+
+    # ------------------------------------------------------------------ reads
+
+    def list_classes(self) -> List[Class]:
+        return self.repo.list_all()
+
+    def list_active_classes(self) -> List[Class]:
+        return self.repo.list_active()
+
+    def get_class(self, class_id: int) -> Optional[Class]:
+        return self.repo.get(class_id)
+
+
+class SectionService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = SectionRepository(session)
+        self.class_repo = ClassRepository(session)
+
+    # ------------------------------------------------------------------ writes
+
+    def add_section(
+        self,
+        class_id: int,
+        name: str,
+        display_order: Optional[int] = None,
+        is_active: bool = True,
+    ) -> Section:
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("Section name is required")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        if self.repo.get_by_class_and_name(class_id, name):
+            raise ValueError(f"Section '{name}' already exists in this class (case-insensitive)")
+        if display_order is None:
+            display_order = self.repo.get_max_display_order(class_id) + 1
+        if display_order < 0:
+            raise ValueError("Display order must be non-negative")
+        item = Section(class_id=class_id, name=name, display_order=display_order, is_active=is_active)
+        try:
+            self.repo.add(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_section(
+        self,
+        section_id: int,
+        name: Optional[str] = None,
+        display_order: Optional[int] = None,
+        is_active: Optional[bool] = None,
+    ) -> Section:
+        item = self.repo.get(section_id)
+        if item is None:
+            raise ValueError("Section not found")
+        proposed_name = item.name
+        proposed_order = item.display_order
+        proposed_active = item.is_active
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Section name is required")
+            if self.repo.get_by_class_and_name(item.class_id, name, exclude_id=section_id):
+                raise ValueError(f"Section '{name}' already exists in this class (case-insensitive)")
+            proposed_name = name
+        if display_order is not None:
+            if display_order < 0:
+                raise ValueError("Display order must be non-negative")
+            proposed_order = display_order
+        if is_active is not None:
+            proposed_active = is_active
+        try:
+            item.name = proposed_name
+            item.display_order = proposed_order
+            item.is_active = proposed_active
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def deactivate_section(self, section_id: int) -> Section:
+        item = self.repo.get(section_id)
+        if item is None:
+            raise ValueError("Section not found")
+        if not item.is_active:
+            return item
+        if self.repo.has_records(section_id):
+            raise ValueError("Cannot deactivate section referenced by academic records")
+        try:
+            item.is_active = False
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def activate_section(self, section_id: int) -> Section:
+        item = self.repo.get(section_id)
+        if item is None:
+            raise ValueError("Section not found")
+        if item.is_active:
+            return item
+        try:
+            item.is_active = True
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def reorder_sections(self, class_id: int, section_orders: List[Tuple[int, int]]) -> None:
+        """Reorder sections within a class by setting new display_order for each section_id.
+
+        section_orders: list of (section_id, new_display_order)
+        """
+        try:
+            for section_id, new_order in section_orders:
+                if new_order < 0:
+                    raise ValueError("Display order must be non-negative")
+                item = self.repo.get(section_id)
+                if item is None:
+                    raise ValueError(f"Section {section_id} not found")
+                if item.class_id != class_id:
+                    raise ValueError(f"Section {section_id} does not belong to class {class_id}")
+                item.display_order = new_order
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def bulk_import(
+        self,
+        class_id: int,
+        names: List[str],
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[Section], List[str]]:
+        """Import multiple sections from a list of names.
+
+        Returns (created_sections, errors).
+        """
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        created = []
+        errors = []
+        for name in names:
+            name = name.strip()
+            if not name:
+                errors.append("Empty name skipped")
+                continue
+            if self.repo.get_by_class_and_name(class_id, name):
+                if skip_duplicates:
+                    errors.append(f"Duplicate skipped: {name}")
+                    continue
+                else:
+                    errors.append(f"Duplicate: {name}")
+                    continue
+            try:
+                sec = self.add_section(class_id, name)
+                created.append(sec)
+            except Exception as exc:
+                errors.append(f"{name}: {exc}")
+        return created, errors
+
+    def bulk_import_from_csv(
+        self,
+        class_id: int,
+        csv_content: str,
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[Section], List[str]]:
+        """Import sections from CSV content. Expected format: name,display_order"""
+        import csv
+        from io import StringIO
+        created = []
+        errors = []
+        reader = csv.reader(StringIO(csv_content))
+        for row_num, row in enumerate(reader, 1):
+            if not row or not row[0].strip():
+                errors.append(f"Row {row_num}: Empty name skipped")
+                continue
+            name = row[0].strip()
+            display_order = None
+            if len(row) > 1 and row[1].strip():
+                try:
+                    display_order = int(row[1].strip())
+                    if display_order < 0:
+                        errors.append(f"Row {row_num} ({name}): Display order must be non-negative")
+                        continue
+                except ValueError:
+                    errors.append(f"Row {row_num} ({name}): Invalid display order")
+                    continue
+            if self.repo.get_by_class_and_name(class_id, name):
+                if skip_duplicates:
+                    errors.append(f"Row {row_num} ({name}): Duplicate skipped")
+                    continue
+                else:
+                    errors.append(f"Row {row_num} ({name}): Duplicate")
+                    continue
+            try:
+                sec = self.add_section(class_id, name, display_order)
+                created.append(sec)
+            except Exception as exc:
+                errors.append(f"Row {row_num} ({name}): {exc}")
+        return created, errors
+
+    # ------------------------------------------------------------------ reads
+
+    def list_sections(self, class_id: int) -> List[Section]:
+        return self.repo.list_by_class(class_id)
+
+    def list_active_sections(self, class_id: int) -> List[Section]:
+        return self.repo.list_active_by_class(class_id)
+
+    def get_section(self, section_id: int) -> Optional[Section]:
+        return self.repo.get(section_id)
+
+
+class SubjectService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = SubjectRepository(session)
+        self.class_repo = ClassRepository(session)
+        self.section_repo = SectionRepository(session)
+
+    # ------------------------------------------------------------------ Subject CRUD
+
+    def add_subject(
+        self,
+        name: str,
+        code: str,
+        description: Optional[str] = None,
+        is_active: bool = True,
+    ) -> Subject:
+        name = (name or "").strip()
+        code = (code or "").strip().upper()
+        if not name:
+            raise ValueError("Subject name is required")
+        if not code:
+            raise ValueError("Subject code is required")
+        if self.repo.get_by_name(name):
+            raise ValueError(f"Subject '{name}' already exists")
+        if self.repo.get_by_code(code):
+            raise ValueError(f"Subject code '{code}' already exists")
+        item = Subject(name=name, code=code, description=description, is_active=is_active)
+        try:
+            self.repo.add(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_subject(
+        self,
+        subject_id: int,
+        name: Optional[str] = None,
+        code: Optional[str] = None,
+        description: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Subject:
+        item = self.repo.get(subject_id)
+        if item is None:
+            raise ValueError("Subject not found")
+        proposed_name = item.name
+        proposed_code = item.code
+        proposed_description = item.description
+        proposed_active = item.is_active
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Subject name is required")
+            if self.repo.exists_by_name(name, exclude_id=subject_id):
+                raise ValueError(f"Subject '{name}' already exists")
+            proposed_name = name
+        if code is not None:
+            code = code.strip().upper()
+            if not code:
+                raise ValueError("Subject code is required")
+            if self.repo.exists_by_code(code, exclude_id=subject_id):
+                raise ValueError(f"Subject code '{code}' already exists")
+            proposed_code = code
+        if description is not None:
+            proposed_description = description.strip() if description else None
+        if is_active is not None:
+            proposed_active = is_active
+        try:
+            item.name = proposed_name
+            item.code = proposed_code
+            item.description = proposed_description
+            item.is_active = proposed_active
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def deactivate_subject(self, subject_id: int) -> Subject:
+        item = self.repo.get(subject_id)
+        if item is None:
+            raise ValueError("Subject not found")
+        if not item.is_active:
+            return item
+        try:
+            item.is_active = False
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def activate_subject(self, subject_id: int) -> Subject:
+        item = self.repo.get(subject_id)
+        if item is None:
+            raise ValueError("Subject not found")
+        if item.is_active:
+            return item
+        try:
+            item.is_active = True
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    # ------------------------------------------------------------------ Subject Class Mapping
+
+    def add_class_mapping(
+        self,
+        subject_id: int,
+        class_id: int,
+        is_active: bool = True,
+    ) -> SubjectClassMapping:
+        subject = self.repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        if self.repo.get_class_mapping_by_subject_class(subject_id, class_id):
+            raise ValueError(f"Subject already mapped to this class")
+        item = SubjectClassMapping(subject_id=subject_id, class_id=class_id, is_active=is_active)
+        try:
+            self.repo.add_class_mapping(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_class_mapping(
+        self,
+        mapping_id: int,
+        is_active: Optional[bool] = None,
+    ) -> SubjectClassMapping:
+        item = self.repo.get_class_mapping(mapping_id)
+        if item is None:
+            raise ValueError("Class mapping not found")
+        if is_active is not None:
+            item.is_active = is_active
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def remove_class_mapping(self, mapping_id: int) -> None:
+        item = self.repo.get_class_mapping(mapping_id)
+        if item is None:
+            raise ValueError("Class mapping not found")
+        try:
+            self.repo.delete_class_mapping(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def remove_class_mapping_by_subject_class(self, subject_id: int, class_id: int) -> None:
+        item = self.repo.get_class_mapping_by_subject_class(subject_id, class_id)
+        if item is not None:
+            self.remove_class_mapping(item.id)
+
+    def set_class_mappings(self, subject_id: int, class_ids: List[int]) -> None:
+        """Replace all class mappings for a subject with the given list of class IDs."""
+        subject = self.repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        try:
+            # Remove all existing mappings
+            existing = self.repo.list_class_mappings_by_subject(subject_id)
+            for mapping in existing:
+                self.repo.delete_class_mapping(mapping)
+            # Add new mappings
+            for class_id in class_ids:
+                class_obj = self.class_repo.get(class_id)
+                if class_obj is None:
+                    raise ValueError(f"Class {class_id} not found")
+                self.repo.add_class_mapping(SubjectClassMapping(
+                    subject_id=subject_id, class_id=class_id, is_active=True
+                ))
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    # ------------------------------------------------------------------ Subject Section Mapping
+
+    def add_section_mapping(
+        self,
+        subject_id: int,
+        class_id: int,
+        section_id: int,
+        is_active: bool = True,
+    ) -> SubjectSectionMapping:
+        subject = self.repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        section = self.section_repo.get(section_id)
+        if section is None:
+            raise ValueError("Section not found")
+        if section.class_id != class_id:
+            raise ValueError("Section does not belong to the specified class")
+        if self.repo.get_section_mapping_by_subject_section(subject_id, section_id):
+            raise ValueError(f"Subject already mapped to this section")
+        item = SubjectSectionMapping(
+            subject_id=subject_id, class_id=class_id, section_id=section_id, is_active=is_active
+        )
+        try:
+            self.repo.add_section_mapping(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_section_mapping(
+        self,
+        mapping_id: int,
+        is_active: Optional[bool] = None,
+    ) -> SubjectSectionMapping:
+        item = self.repo.get_section_mapping(mapping_id)
+        if item is None:
+            raise ValueError("Section mapping not found")
+        if is_active is not None:
+            item.is_active = is_active
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def remove_section_mapping(self, mapping_id: int) -> None:
+        item = self.repo.get_section_mapping(mapping_id)
+        if item is None:
+            raise ValueError("Section mapping not found")
+        try:
+            self.repo.delete_section_mapping(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def set_section_mappings_for_class(
+        self,
+        subject_id: int,
+        class_id: int,
+        section_ids: List[int],
+        all_sections: bool = False,
+    ) -> None:
+        """Set section mappings for a subject within a specific class.
+
+        If all_sections is True, map to all active sections of the class.
+        Otherwise, map only to the provided section_ids.
+        """
+        subject = self.repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        try:
+            # Remove existing section mappings for this subject in this class
+            existing = self.repo.list_section_mappings_by_class(class_id)
+            for mapping in existing:
+                if mapping.subject_id == subject_id:
+                    self.repo.delete_section_mapping(mapping)
+            # Add new mappings
+            if all_sections:
+                sections = self.section_repo.list_active_by_class(class_id)
+                target_section_ids = [s.id for s in sections]
+            else:
+                target_section_ids = section_ids
+            for section_id in target_section_ids:
+                section = self.section_repo.get(section_id)
+                if section is None or section.class_id != class_id:
+                    continue
+                self.repo.add_section_mapping(SubjectSectionMapping(
+                    subject_id=subject_id, class_id=class_id, section_id=section_id, is_active=True
+                ))
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def copy_mappings_from_subject(self, source_subject_id: int, target_subject_id: int) -> None:
+        """Copy all class and section mappings from one subject to another."""
+        source = self.repo.get(source_subject_id)
+        if source is None:
+            raise ValueError("Source subject not found")
+        target = self.repo.get(target_subject_id)
+        if target is None:
+            raise ValueError("Target subject not found")
+        try:
+            # Clear target's existing mappings
+            existing_class = self.repo.list_class_mappings_by_subject(target_subject_id)
+            for m in existing_class:
+                self.repo.delete_class_mapping(m)
+            existing_section = self.repo.list_section_mappings_by_subject(target_subject_id)
+            for m in existing_section:
+                self.repo.delete_section_mapping(m)
+            # Copy class mappings
+            source_class_mappings = self.repo.list_class_mappings_by_subject(source_subject_id)
+            for m in source_class_mappings:
+                self.repo.add_class_mapping(SubjectClassMapping(
+                    subject_id=target_subject_id, class_id=m.class_id, is_active=m.is_active
+                ))
+            # Copy section mappings
+            source_section_mappings = self.repo.list_section_mappings_by_subject(source_subject_id)
+            for m in source_section_mappings:
+                self.repo.add_section_mapping(SubjectSectionMapping(
+                    subject_id=target_subject_id, class_id=m.class_id, section_id=m.section_id, is_active=m.is_active
+                ))
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    # ------------------------------------------------------------------ Cascade Assignment Methods
+
+    def get_sections_for_class(self, class_id: int) -> List[Section]:
+        """Get all active sections for a class."""
+        return self.section_repo.list_active_by_class(class_id)
+
+    def get_available_subjects_for_section(self, class_id: int, section_id: int) -> List[Subject]:
+        """Get subjects not yet mapped to this class+section."""
+        all_subjects = self.repo.list_active()
+        mapped = self.repo.list_section_mappings_by_class(class_id)
+        mapped_subject_ids = {m.subject_id for m in mapped if m.section_id == section_id}
+        return [s for s in all_subjects if s.id not in mapped_subject_ids]
+
+    def get_assignments_for_class_section(self, class_id: int, section_id: int) -> List[SubjectSectionMapping]:
+        """Get all subject assignments for a specific class+section."""
+        mappings = self.repo.list_section_mappings_by_class(class_id)
+        return [m for m in mappings if m.section_id == section_id and m.is_active]
+
+    def assign_subject_to_section(
+        self,
+        subject_id: int,
+        class_id: int,
+        section_id: int,
+    ) -> SubjectSectionMapping:
+        """Assign a subject to a class+section (auto-save)."""
+        subject = self.repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        section = self.section_repo.get(section_id)
+        if section is None:
+            raise ValueError("Section not found")
+        if section.class_id != class_id:
+            raise ValueError("Section does not belong to the selected class")
+        if self.repo.get_section_mapping_by_subject_section(subject_id, section_id):
+            raise ValueError(f"Subject already mapped to this section")
+        item = SubjectSectionMapping(
+            subject_id=subject_id, class_id=class_id, section_id=section_id, is_active=True
+        )
+        try:
+            self.repo.add_section_mapping(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def remove_subject_from_section(
+        self,
+        subject_id: int,
+        section_id: int,
+    ) -> None:
+        """Remove a subject from a section."""
+        mapping = self.repo.get_section_mapping_by_subject_section(subject_id, section_id)
+        if mapping is None:
+            raise ValueError("Mapping not found")
+        try:
+            self.repo.delete_section_mapping(mapping)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    # ------------------------------------------------------------------ Bulk Operations
+
+    def bulk_import_subjects(
+        self,
+        subjects: List[dict],
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[Subject], List[str]]:
+        """Import multiple subjects from list of dicts with keys: name, code, description, is_active."""
+        created = []
+        errors = []
+        for idx, subj in enumerate(subjects):
+            name = (subj.get("name") or "").strip()
+            code = (subj.get("code") or "").strip().upper()
+            description = subj.get("description")
+            is_active = subj.get("is_active", True)
+            if not name:
+                errors.append(f"Row {idx + 1}: Empty name skipped")
+                continue
+            if not code:
+                errors.append(f"Row {idx + 1} ({name}): Empty code skipped")
+                continue
+            if self.repo.exists_by_name(name):
+                if skip_duplicates:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate skipped")
+                    continue
+                else:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate")
+                    continue
+            if self.repo.exists_by_code(code):
+                if skip_duplicates:
+                    errors.append(f"Row {idx + 1} ({name}): Code duplicate skipped")
+                    continue
+                else:
+                    errors.append(f"Row {idx + 1} ({name}): Code duplicate")
+                    continue
+            try:
+                subj_obj = self.add_subject(name, code, description, is_active)
+                created.append(subj_obj)
+            except Exception as exc:
+                errors.append(f"Row {idx + 1} ({name}): {exc}")
+        return created, errors
+
+    def export_subjects_to_csv(self) -> str:
+        """Export all subjects to CSV string."""
+        import csv
+        from io import StringIO
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Name", "Code", "Description", "Active"])
+        for subj in self.repo.list_all():
+            writer.writerow([subj.name, subj.code, subj.description or "", "Yes" if subj.is_active else "No"])
+        return output.getvalue()
+
+    def export_mappings_to_csv(self) -> str:
+        """Export all subject-class-section mappings to CSV string."""
+        import csv
+        from io import StringIO
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Subject Name", "Subject Code", "Class Name", "Section Name", "Active"])
+        for subj in self.repo.list_all():
+            # Class mappings
+            class_mappings = self.repo.list_active_class_mappings_by_subject(subj.id)
+            if class_mappings:
+                for m in class_mappings:
+                    writer.writerow([subj.name, subj.code, m.class_.name, "ALL", "Yes" if m.is_active else "No"])
+            # Section mappings
+            section_mappings = self.repo.list_active_section_mappings_by_subject(subj.id)
+            for m in section_mappings:
+                writer.writerow([subj.name, subj.code, m.class_.name, m.section.name, "Yes" if m.is_active else "No"])
+            # Subject with no mappings
+            if not class_mappings and not section_mappings:
+                writer.writerow([subj.name, subj.code, "", "", ""])
+        return output.getvalue()
+
+    # ------------------------------------------------------------------ Reads
+
+    def list_subjects(self) -> List[Subject]:
+        return self.repo.list_all()
+
+    def list_active_subjects(self) -> List[Subject]:
+        return self.repo.list_active()
+
+    def get_subject(self, subject_id: int) -> Optional[Subject]:
+        return self.repo.get(subject_id)
+
+    def get_subject_by_code(self, code: str) -> Optional[Subject]:
+        return self.repo.get_by_code(code)
+
+    def get_class_mappings(self, subject_id: int) -> List[SubjectClassMapping]:
+        return self.repo.list_class_mappings_by_subject(subject_id)
+
+    def get_active_class_mappings(self, subject_id: int) -> List[SubjectClassMapping]:
+        return self.repo.list_active_class_mappings_by_subject(subject_id)
+
+    def get_section_mappings(self, subject_id: int) -> List[SubjectSectionMapping]:
+        return self.repo.list_section_mappings_by_subject(subject_id)
+
+    def get_active_section_mappings(self, subject_id: int) -> List[SubjectSectionMapping]:
+        return self.repo.list_active_section_mappings_by_subject(subject_id)
+
+    def get_section_mappings_by_class(self, class_id: int) -> List[SubjectSectionMapping]:
+        return self.repo.list_section_mappings_by_class(class_id)
+
+    def get_subjects_for_class_section(self, class_id: int, section_id: int) -> List[Subject]:
+        """Get subjects mapped to a class+section."""
+        mappings = self.repo.list_section_mappings_by_class_section(class_id, section_id)
+        return [m.subject for m in mappings if m.subject and m.subject.is_active]
+
+
+class StudentService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = StudentRepository(session)
+        self.session_repo = SessionRepository(session)
+        self.class_repo = ClassRepository(session)
+        self.section_repo = SectionRepository(session)
+
+    # ------------------------------------------------------------------ writes
+
+    def add_student(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        name: str,
+        roll_number: str,
+        father_name: Optional[str] = None,
+        mother_name: Optional[str] = None,
+        dob: Optional[date] = None,
+        gender: Optional[str] = None,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+        address: Optional[str] = None,
+        is_active: bool = True,
+    ) -> Student:
+        name = (name or "").strip()
+        roll_number = (roll_number or "").strip()
+        if not name:
+            raise ValueError("Student name is required")
+        if not roll_number:
+            raise ValueError("Roll number is required")
+        
+        session_obj = self.session_repo.get(session_id)
+        if session_obj is None:
+            raise ValueError("Academic session not found")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        section_obj = self.section_repo.get(section_id)
+        if section_obj is None:
+            raise ValueError("Section not found")
+        if section_obj.class_id != class_id:
+            raise ValueError("Section does not belong to the selected class")
+        
+        if self.repo.get_by_roll_number(session_id, class_id, section_id, roll_number):
+            raise ValueError(f"Roll number '{roll_number}' already exists in this session/class/section")
+        
+        admission_number = self.repo.get_next_admission_number()
+        if self.repo.exists_by_admission_number(admission_number):
+            # Find the next available admission number
+            i = 1
+            while True:
+                test_num = f"STU{int(admission_number[3:]) + i:06d}"
+                if not self.repo.exists_by_admission_number(test_num):
+                    admission_number = test_num
+                    break
+                i += 1
+        
+        item = Student(
+            admission_number=admission_number,
+            session_id=session_id,
+            class_id=class_id,
+            section_id=section_id,
+            roll_number=roll_number,
+            name=name,
+            father_name=father_name,
+            mother_name=mother_name,
+            dob=dob,
+            gender=gender,
+            phone=phone,
+            email=email,
+            address=address,
+            is_active=is_active,
+        )
+        try:
+            self.repo.add(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_student(
+        self,
+        student_id: int,
+        name: Optional[str] = None,
+        roll_number: Optional[str] = None,
+        father_name: Optional[str] = None,
+        mother_name: Optional[str] = None,
+        dob: Optional[date] = None,
+        gender: Optional[str] = None,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+        address: Optional[str] = None,
+        is_active: Optional[bool] = None,
+    ) -> Student:
+        item = self.repo.get(student_id)
+        if item is None:
+            raise ValueError("Student not found")
+        
+        proposed_name = item.name
+        proposed_roll = item.roll_number
+        proposed_father = item.father_name
+        proposed_mother = item.mother_name
+        proposed_dob = item.dob
+        proposed_gender = item.gender
+        proposed_phone = item.phone
+        proposed_email = item.email
+        proposed_address = item.address
+        proposed_active = item.is_active
+        
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Student name is required")
+            proposed_name = name
+        
+        if roll_number is not None:
+            roll_number = roll_number.strip()
+            if not roll_number:
+                raise ValueError("Roll number is required")
+            if self.repo.exists_by_roll_number(item.session_id, item.class_id, item.section_id, roll_number, exclude_id=student_id):
+                raise ValueError(f"Roll number '{roll_number}' already exists in this session/class/section")
+            proposed_roll = roll_number
+        
+        if father_name is not None:
+            proposed_father = father_name.strip() if father_name else None
+        if mother_name is not None:
+            proposed_mother = mother_name.strip() if mother_name else None
+        if dob is not None:
+            proposed_dob = dob
+        if gender is not None:
+            proposed_gender = gender
+        if phone is not None:
+            proposed_phone = phone.strip() if phone else None
+        if email is not None:
+            proposed_email = email.strip() if email else None
+        if address is not None:
+            proposed_address = address.strip() if address else None
+        if is_active is not None:
+            proposed_active = is_active
+        
+        try:
+            item.name = proposed_name
+            item.roll_number = proposed_roll
+            item.father_name = proposed_father
+            item.mother_name = proposed_mother
+            item.dob = proposed_dob
+            item.gender = proposed_gender
+            item.phone = proposed_phone
+            item.email = proposed_email
+            item.address = proposed_address
+            item.is_active = proposed_active
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def deactivate_student(self, student_id: int) -> Student:
+        item = self.repo.get(student_id)
+        if item is None:
+            raise ValueError("Student not found")
+        if not item.is_active:
+            return item
+        try:
+            item.is_active = False
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def activate_student(self, student_id: int) -> Student:
+        item = self.repo.get(student_id)
+        if item is None:
+            raise ValueError("Student not found")
+        if item.is_active:
+            return item
+        try:
+            item.is_active = True
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def bulk_import(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        students: List[dict],
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[Student], List[str]]:
+        """Import multiple students from list of dicts.
+        Expected keys: name, roll_number, father_name, mother_name, dob, gender, phone, email, address, is_active
+        """
+        session_obj = self.session_repo.get(session_id)
+        if session_obj is None:
+            raise ValueError("Academic session not found")
+        class_obj = self.class_repo.get(class_id)
+        if class_obj is None:
+            raise ValueError("Class not found")
+        section_obj = self.section_repo.get(section_id)
+        if section_obj is None:
+            raise ValueError("Section not found")
+        if section_obj.class_id != class_id:
+            raise ValueError("Section does not belong to the selected class")
+        
+        created = []
+        errors = []
+        for idx, stu in enumerate(students):
+            name = (stu.get("name") or "").strip()
+            roll_number = (stu.get("roll_number") or "").strip()
+            if not name:
+                errors.append(f"Row {idx + 1}: Empty name skipped")
+                continue
+            if not roll_number:
+                errors.append(f"Row {idx + 1} ({name}): Empty roll number skipped")
+                continue
+            if self.repo.get_by_roll_number(session_id, class_id, section_id, roll_number):
+                if skip_duplicates:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate roll number skipped")
+                    continue
+                else:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate roll number")
+                    continue
+            try:
+                stu_obj = self.add_student(
+                    session_id=session_id,
+                    class_id=class_id,
+                    section_id=section_id,
+                    name=name,
+                    roll_number=roll_number,
+                    father_name=stu.get("father_name"),
+                    mother_name=stu.get("mother_name"),
+                    dob=stu.get("dob"),
+                    gender=stu.get("gender"),
+                    phone=stu.get("phone"),
+                    email=stu.get("email"),
+                    address=stu.get("address"),
+                    is_active=stu.get("is_active", True),
+                )
+                created.append(stu_obj)
+            except Exception as exc:
+                errors.append(f"Row {idx + 1} ({name}): {exc}")
+        return created, errors
+
+    def export_students_to_csv(self, session_id: int, class_id: int, section_id: int) -> str:
+        """Export students to CSV string."""
+        import csv
+        from io import StringIO
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Admission Number", "Roll Number", "Name", "Father's Name", "Mother's Name",
+            "DOB", "Gender", "Phone", "Email", "Address", "Active"
+        ])
+        for stu in self.repo.list_by_section(session_id, class_id, section_id):
+            writer.writerow([
+                stu.admission_number, stu.roll_number, stu.name,
+                stu.father_name or "", stu.mother_name or "",
+                str(stu.dob) if stu.dob else "", stu.gender or "",
+                stu.phone or "", stu.email or "", stu.address or "",
+                "Yes" if stu.is_active else "No"
+            ])
+        return output.getvalue()
+
+    # ------------------------------------------------------------------ reads
+
+    def list_students(self, session_id: int, class_id: int, section_id: int) -> List[Student]:
+        return self.repo.list_by_section(session_id, class_id, section_id)
+
+    def list_active_students(self, session_id: int, class_id: int, section_id: int) -> List[Student]:
+        return self.repo.list_active_by_section(session_id, class_id, section_id)
+
+    def get_student(self, student_id: int) -> Optional[Student]:
+        return self.repo.get(student_id)
+
+    def get_student_by_admission(self, admission_number: str) -> Optional[Student]:
+        return self.repo.get_by_admission_number(admission_number)
+
+    def search_students(self, query: str, session_id: int | None = None, class_id: int | None = None, section_id: int | None = None) -> List[Student]:
+        return self.repo.search(query, session_id, class_id, section_id)
+
+
+class ExamTypeService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = ExamTypeRepository(session)
+
+    # ------------------------------------------------------------------ writes
+
+    def add_exam_type(
+        self,
+        name: str,
+        code: str,
+        description: Optional[str] = None,
+        max_marks: int = 100,
+        weightage: float = 1.0,
+        display_order: Optional[int] = None,
+        is_active: bool = True,
+    ) -> ExamType:
+        name = (name or "").strip()
+        code = (code or "").strip().upper()
+        if not name:
+            raise ValueError("Exam type name is required")
+        if not code:
+            raise ValueError("Exam type code is required")
+        if max_marks <= 0:
+            raise ValueError("Max marks must be positive")
+        if weightage < 0:
+            raise ValueError("Weightage cannot be negative")
+        if self.repo.get_by_name(name):
+            raise ValueError(f"Exam type '{name}' already exists")
+        if self.repo.get_by_code(code):
+            raise ValueError(f"Exam type code '{code}' already exists")
+        if display_order is None:
+            display_order = self.repo.get_max_display_order() + 1
+        if display_order < 0:
+            raise ValueError("Display order must be non-negative")
+        item = ExamType(
+            name=name,
+            code=code,
+            description=description,
+            max_marks=max_marks,
+            weightage=weightage,
+            display_order=display_order,
+            is_active=is_active,
+        )
+        try:
+            self.repo.add(item)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def update_exam_type(
+        self,
+        exam_type_id: int,
+        name: Optional[str] = None,
+        code: Optional[str] = None,
+        description: Optional[str] = None,
+        max_marks: Optional[int] = None,
+        weightage: Optional[float] = None,
+        display_order: Optional[int] = None,
+        is_active: Optional[bool] = None,
+    ) -> ExamType:
+        item = self.repo.get(exam_type_id)
+        if item is None:
+            raise ValueError("Exam type not found")
+        proposed_name = item.name
+        proposed_code = item.code
+        proposed_description = item.description
+        proposed_max_marks = item.max_marks
+        proposed_weightage = item.weightage
+        proposed_order = item.display_order
+        proposed_active = item.is_active
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Exam type name is required")
+            if self.repo.exists_by_name(name, exclude_id=exam_type_id):
+                raise ValueError(f"Exam type '{name}' already exists")
+            proposed_name = name
+        if code is not None:
+            code = code.strip().upper()
+            if not code:
+                raise ValueError("Exam type code is required")
+            if self.repo.exists_by_code(code, exclude_id=exam_type_id):
+                raise ValueError(f"Exam type code '{code}' already exists")
+            proposed_code = code
+        if description is not None:
+            proposed_description = description.strip() if description else None
+        if max_marks is not None:
+            if max_marks <= 0:
+                raise ValueError("Max marks must be positive")
+            proposed_max_marks = max_marks
+        if weightage is not None:
+            if weightage < 0:
+                raise ValueError("Weightage cannot be negative")
+            proposed_weightage = weightage
+        if display_order is not None:
+            if display_order < 0:
+                raise ValueError("Display order must be non-negative")
+            proposed_order = display_order
+        if is_active is not None:
+            proposed_active = is_active
+        try:
+            item.name = proposed_name
+            item.code = proposed_code
+            item.description = proposed_description
+            item.max_marks = proposed_max_marks
+            item.weightage = proposed_weightage
+            item.display_order = proposed_order
+            item.is_active = proposed_active
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def deactivate_exam_type(self, exam_type_id: int) -> ExamType:
+        item = self.repo.get(exam_type_id)
+        if item is None:
+            raise ValueError("Exam type not found")
+        if not item.is_active:
+            return item
+        try:
+            item.is_active = False
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def activate_exam_type(self, exam_type_id: int) -> ExamType:
+        item = self.repo.get(exam_type_id)
+        if item is None:
+            raise ValueError("Exam type not found")
+        if item.is_active:
+            return item
+        try:
+            item.is_active = True
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return item
+
+    def reorder_exam_types(self, exam_type_orders: List[Tuple[int, int]]) -> None:
+        """Reorder exam types by setting new display_order for each exam_type_id.
+
+        exam_type_orders: list of (exam_type_id, new_display_order)
+        """
+        try:
+            for exam_type_id, new_order in exam_type_orders:
+                if new_order < 0:
+                    raise ValueError("Display order must be non-negative")
+                item = self.repo.get(exam_type_id)
+                if item is None:
+                    raise ValueError(f"Exam type {exam_type_id} not found")
+                item.display_order = new_order
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def bulk_import(
+        self,
+        exam_types: List[dict],
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[ExamType], List[str]]:
+        """Import multiple exam types from list of dicts.
+
+        Expected keys: name, code, description, max_marks, weightage, is_active
+        """
+        created = []
+        errors = []
+        for idx, et in enumerate(exam_types):
+            name = (et.get("name") or "").strip()
+            code = (et.get("code") or "").strip().upper()
+            if not name:
+                errors.append(f"Row {idx + 1}: Empty name skipped")
+                continue
+            if not code:
+                errors.append(f"Row {idx + 1} ({name}): Empty code skipped")
+                continue
+            if self.repo.exists_by_name(name):
+                if skip_duplicates:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate skipped")
+                    continue
+                else:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate")
+                    continue
+            if self.repo.exists_by_code(code):
+                if skip_duplicates:
+                    errors.append(f"Row {idx + 1} ({name}): Code duplicate skipped")
+                    continue
+                else:
+                    errors.append(f"Row {idx + 1} ({name}): Code duplicate")
+                    continue
+            try:
+                et_obj = self.add_exam_type(
+                    name=name,
+                    code=code,
+                    description=et.get("description"),
+                    max_marks=et.get("max_marks", 100),
+                    weightage=et.get("weightage", 1.0),
+                    is_active=et.get("is_active", True),
+                )
+                created.append(et_obj)
+            except Exception as exc:
+                errors.append(f"Row {idx + 1} ({name}): {exc}")
+        return created, errors
+
+    def export_exam_types_to_csv(self) -> str:
+        """Export all exam types to CSV string."""
+        import csv
+        from io import StringIO
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Name", "Code", "Description", "Max Marks", "Weightage", "Active"])
+        for et in self.repo.list_all():
+            writer.writerow([et.name, et.code, et.description or "", et.max_marks, et.weightage, "Yes" if et.is_active else "No"])
+        return output.getvalue()
+
+    # ------------------------------------------------------------------ reads
+
+    def list_exam_types(self) -> List[ExamType]:
+        return self.repo.list_all()
+
+    def list_active_exam_types(self) -> List[ExamType]:
+        return self.repo.list_active()
+
+    def get_exam_type(self, exam_type_id: int) -> Optional[ExamType]:
+        return self.repo.get(exam_type_id)
+
+    def get_exam_type_by_code(self, code: str) -> Optional[ExamType]:
+        return self.repo.get_by_code(code)
+
+
+class MarksService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = MarksRepository(session)
+        self.audit_repo = MarksAuditLogRepository(session)
+        self.draft_repo = MarksDraftRepository(session)
+        self.mapping_repo = UserClassSubjectMappingRepository(session)
+        self.student_repo = StudentRepository(session)
+        self.subject_repo = SubjectRepository(session)
+        self.exam_type_repo = ExamTypeRepository(session)
+        self.session_repo = SessionRepository(session)
+        self.class_repo = ClassRepository(session)
+        self.section_repo = SectionRepository(session)
+
+    def _log_audit(
+        self,
+        marks: Marks,
+        field_changed: str,
+        old_value: str | None,
+        new_value: str | None,
+        old_status: str | None,
+        new_status: str | None,
+        action: str,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> MarksAuditLog:
+        """Create an audit log entry for a marks change."""
+        audit = MarksAuditLog(
+            marks_id=marks.id,
+            student_id=marks.student_id,
+            subject_id=marks.subject_id,
+            exam_type_id=marks.exam_type_id,
+            session_id=marks.session_id,
+            class_id=marks.class_id,
+            section_id=marks.section_id,
+            field_changed=field_changed,
+            old_value=old_value,
+            new_value=new_value,
+            old_status=old_status,
+            new_status=new_status,
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+        )
+        self.audit_repo.add(audit)
+        return audit
+
+    # ------------------------------------------------------------------ writes
+
+    def save_marks(
+        self,
+        student_id: int,
+        subject_id: int,
+        exam_type_id: int,
+        marks_obtained: int | None,
+        status: str = "saved",
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> Marks:
+        """Save or update marks for a student-subject-exam combination."""
+        if status not in ("pending", "absent", "saved", "locked"):
+            raise ValueError("Invalid status")
+        
+        student = self.student_repo.get(student_id)
+        if student is None:
+            raise ValueError("Student not found")
+        subject = self.subject_repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        exam_type = self.exam_type_repo.get(exam_type_id)
+        if exam_type is None:
+            raise ValueError("Exam type not found")
+        
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            if not _check_marks_permission(user, Permission.MARKS_EDIT, student.session_id, student.class_id, subject_id, student.section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to edit marks for this class/subject")
+        
+        if marks_obtained is not None:
+            if marks_obtained < 0 or marks_obtained > exam_type.max_marks:
+                raise ValueError(f"Marks must be between 0 and {exam_type.max_marks}")
+        
+        existing = self.repo.get_by_student_subject_exam(student_id, subject_id, exam_type_id)
+        if existing:
+            if existing.status == "locked":
+                raise ValueError("Cannot modify locked marks")
+            
+            # Capture old values for audit
+            old_marks_obtained = str(existing.marks_obtained) if existing.marks_obtained is not None else None
+            old_status = existing.status
+            
+            existing.marks_obtained = marks_obtained
+            existing.max_marks = exam_type.max_marks
+            existing.status = status
+            existing.session_id = student.session_id
+            existing.class_id = student.class_id
+            existing.section_id = student.section_id
+            try:
+                self.session.commit()
+                
+                # Write audit log after successful commit
+                if old_marks_obtained != (str(marks_obtained) if marks_obtained is not None else None) or old_status != status:
+                    self._log_audit(
+                        marks=existing,
+                        field_changed="marks_obtained,status",
+                        old_value=old_marks_obtained,
+                        new_value=str(marks_obtained) if marks_obtained is not None else None,
+                        old_status=old_status,
+                        new_status=status,
+                        action="update",
+                        user_id=user_id,
+                        user_name=user_name,
+                    )
+                    self.session.commit()
+            except Exception:
+                self.session.rollback()
+                raise
+            return existing
+        
+        marks = Marks(
+            student_id=student_id,
+            subject_id=subject_id,
+            exam_type_id=exam_type_id,
+            session_id=student.session_id,
+            class_id=student.class_id,
+            section_id=student.section_id,
+            marks_obtained=marks_obtained,
+            max_marks=exam_type.max_marks,
+            status=status,
+        )
+        try:
+            self.repo.add(marks)
+            self.session.flush()  # Get marks.id
+            
+            # Write audit log for insert
+            self._log_audit(
+                marks=marks,
+                field_changed="marks_obtained,status",
+                old_value=None,
+                new_value=str(marks_obtained) if marks_obtained is not None else None,
+                old_status=None,
+                new_status=status,
+                action="insert",
+                user_id=user_id,
+                user_name=user_name,
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return marks
+
+    def bulk_save_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        marks_data: List[dict],
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> Tuple[List[Marks], List[str]]:
+        """Bulk save marks from list of dicts with keys: student_id, subject_id, marks_obtained, status."""
+        # Check authorization for bulk save
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            if not _check_marks_permission(user, Permission.MARKS_BULK_SAVE, session_id, class_id, 0, section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions for bulk save")
+        
+        exam_type = self.exam_type_repo.get(exam_type_id)
+        if exam_type is None:
+            raise ValueError("Exam type not found")
+        
+        created = []
+        errors = []
+        for idx, data in enumerate(marks_data):
+            student_id = data.get("student_id")
+            subject_id = data.get("subject_id")
+            marks_obtained = data.get("marks_obtained")
+            status = data.get("status", "saved")
+            
+            if student_id is None or subject_id is None:
+                errors.append(f"Row {idx + 1}: Missing student_id or subject_id")
+                continue
+            
+            student = self.student_repo.get(student_id)
+            if student is None:
+                errors.append(f"Row {idx + 1}: Student not found")
+                continue
+            if student.session_id != session_id or student.class_id != class_id or student.section_id != section_id:
+                errors.append(f"Row {idx + 1}: Student not in selected session/class/section")
+                continue
+            
+            subject = self.subject_repo.get(subject_id)
+            if subject is None:
+                errors.append(f"Row {idx + 1}: Subject not found")
+                continue
+            
+            if marks_obtained is not None:
+                if marks_obtained < 0 or marks_obtained > exam_type.max_marks:
+                    errors.append(f"Row {idx + 1}: Marks must be between 0 and {exam_type.max_marks}")
+                    continue
+            
+            try:
+                marks = self.save_marks(student_id, subject_id, exam_type_id, marks_obtained, status, user_id, user_name)
+                created.append(marks)
+            except ValueError as exc:
+                errors.append(f"Row {idx + 1}: {exc}")
+        
+        return created, errors
+
+    def lock_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        subject_id: int | None = None,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> int:
+        """Lock all marks for a session/class/section/exam. Returns count of locked entries."""
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            if not _check_marks_permission(user, Permission.MARKS_LOCK, session_id, class_id, subject_id or 0, section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to lock marks")
+        
+        if subject_id is not None:
+            marks_list = self.repo.list_by_section_exam_subject(session_id, class_id, section_id, exam_type_id, subject_id)
+        else:
+            marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for marks in marks_list:
+            if marks.status in ("saved", "pending"):
+                old_status = marks.status
+                marks.status = "locked"
+                count += 1
+                try:
+                    self.session.commit()
+                    
+                    # Write audit log for lock
+                    self._log_audit(
+                        marks=marks,
+                        field_changed="status",
+                        old_value=None,
+                        new_value=None,
+                        old_status=old_status,
+                        new_status="locked",
+                        action="lock",
+                        user_id=user_id,
+                        user_name=user_name,
+                    )
+                    self.session.commit()
+                except Exception:
+                    self.session.rollback()
+                    raise
+        return count
+
+    def unlock_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        subject_id: int | None = None,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> int:
+        """Unlock all marks for a session/class/section/exam. Returns count of unlocked entries."""
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            if not _check_marks_permission(user, Permission.MARKS_UNLOCK, session_id, class_id, subject_id or 0, section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to unlock marks")
+        
+        if subject_id is not None:
+            marks_list = self.repo.list_by_section_exam_subject(session_id, class_id, section_id, exam_type_id, subject_id)
+        else:
+            marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for marks in marks_list:
+            if marks.status == "locked":
+                old_status = marks.status
+                marks.status = "saved"
+                count += 1
+                try:
+                    self.session.commit()
+                    
+                    # Write audit log for unlock
+                    self._log_audit(
+                        marks=marks,
+                        field_changed="status",
+                        old_value=None,
+                        new_value=None,
+                        old_status=old_status,
+                        new_status="saved",
+                        action="unlock",
+                        user_id=user_id,
+                        user_name=user_name,
+                    )
+                    self.session.commit()
+                except Exception:
+                    self.session.rollback()
+                    raise
+        return count
+
+    # ------------------------------------------------------------------ reads
+
+    def get_marks(self, marks_id: int) -> Optional[Marks]:
+        return self.repo.get(marks_id)
+
+    def get_marks_by_student_subject_exam(
+        self,
+        student_id: int,
+        subject_id: int,
+        exam_type_id: int,
+    ) -> Optional[Marks]:
+        return self.repo.get_by_student_subject_exam(student_id, subject_id, exam_type_id)
+
+    def list_marks_for_entry(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        subject_id: int | None = None,
+    ) -> List[Marks]:
+        """Get all marks entries for the marks entry grid."""
+        if subject_id is not None:
+            return self.repo.list_by_section_exam_subject(session_id, class_id, section_id, exam_type_id, subject_id)
+        return self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+
+    def list_marks_by_student(self, student_id: int) -> List[Marks]:
+        return self.repo.list_by_student(student_id)
+
+    def list_marks_by_student_exam(self, student_id: int, exam_type_id: int) -> List[Marks]:
+        return self.repo.list_by_student_exam(student_id, exam_type_id)
+
+    def get_subjects_for_class_section(self, class_id: int, section_id: int) -> List[Subject]:
+        """Get subjects mapped to a class+section."""
+        mappings = self.subject_repo.list_section_mappings_by_class_section(class_id, section_id)
+        return [m.subject for m in mappings if m.subject and m.subject.is_active]
+
+    # ------------------------------------------------------------------ draft handling
+
+    def save_draft(
+        self,
+        student_id: int,
+        subject_id: int,
+        exam_type_id: int,
+        marks_obtained: int | None,
+        status: str = "draft",
+        user_id: int | None = None,
+    ) -> MarksDraft:
+        """Save or update a draft for a student-subject-exam combination."""
+        if status not in ("draft", "pending", "absent"):
+            raise ValueError("Invalid draft status")
+        
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            # Will check with actual student data after fetching student
+        
+        student = self.student_repo.get(student_id)
+        if student is None:
+            raise ValueError("Student not found")
+        
+        # Check authorization with actual student data
+        if user_id is not None:
+            if not _check_marks_permission(user, Permission.MARKS_DRAFT_SAVE, student.session_id, student.class_id, subject_id, student.section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to save draft for this class/subject")
+        
+        subject = self.subject_repo.get(subject_id)
+        if subject is None:
+            raise ValueError("Subject not found")
+        exam_type = self.exam_type_repo.get(exam_type_id)
+        if exam_type is None:
+            raise ValueError("Exam type not found")
+        
+        if marks_obtained is not None:
+            if marks_obtained < 0 or marks_obtained > exam_type.max_marks:
+                raise ValueError(f"Marks must be between 0 and {exam_type.max_marks}")
+        
+        existing = self.draft_repo.get_by_student_subject_exam(student_id, subject_id, exam_type_id)
+        if existing:
+            existing.marks_obtained = marks_obtained
+            existing.max_marks = exam_type.max_marks
+            existing.status = status
+            existing.session_id = student.session_id
+            existing.class_id = student.class_id
+            existing.section_id = student.section_id
+            try:
+                self.session.commit()
+            except Exception:
+                self.session.rollback()
+                raise
+            return existing
+        
+        draft = MarksDraft(
+            student_id=student_id,
+            subject_id=subject_id,
+            exam_type_id=exam_type_id,
+            session_id=student.session_id,
+            class_id=student.class_id,
+            section_id=student.section_id,
+            marks_obtained=marks_obtained,
+            max_marks=exam_type.max_marks,
+            status=status,
+        )
+        try:
+            self.draft_repo.add(draft)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return draft
+
+    def get_draft(self, student_id: int, subject_id: int, exam_type_id: int) -> Optional[MarksDraft]:
+        """Get a draft for a student-subject-exam combination."""
+        return self.draft_repo.get_by_student_subject_exam(student_id, subject_id, exam_type_id)
+
+    def list_drafts_for_entry(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        subject_id: int | None = None,
+    ) -> List[MarksDraft]:
+        """Get all drafts for the marks entry grid."""
+        if subject_id is not None:
+            return self.draft_repo.list_by_section_exam_subject(session_id, class_id, section_id, exam_type_id, subject_id)
+        return self.draft_repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+
+    def discard_draft(
+        self,
+        student_id: int,
+        subject_id: int,
+        exam_type_id: int,
+        user_id: int | None = None,
+    ) -> bool:
+        """Discard a draft for a student-subject-exam combination. Returns True if deleted."""
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            student = self.student_repo.get(student_id)
+            if not student:
+                raise ValueError("Student not found")
+            if not _check_marks_permission(user, Permission.MARKS_DRAFT_DISCARD, student.session_id, student.class_id, subject_id, student.section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to discard draft for this class/subject")
+        
+        count = self.draft_repo.delete_by_student_subject_exam(student_id, subject_id, exam_type_id)
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return count > 0
+
+    def discard_all_drafts(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        user_id: int | None = None,
+    ) -> int:
+        """Discard all drafts for a session/class/section/exam. Returns count deleted."""
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            if not _check_marks_permission(user, Permission.MARKS_DRAFT_DISCARD, session_id, class_id, 0, section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to discard drafts for this class")
+        
+        drafts = self.draft_repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for draft in drafts:
+            self.draft_repo.delete(draft)
+            count += 1
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return count
+
+    def promote_drafts_to_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> Tuple[List[Marks], List[str]]:
+        """Promote all drafts for a session/class/section/exam to official marks.
+        
+        Returns tuple of (created_marks, errors).
+        """
+        # Check authorization
+        if user_id is not None:
+            user = self.student_repo.session.query(User).get(user_id)
+            if not user or not user.is_active:
+                raise ValueError("Invalid or inactive user")
+            if not _check_marks_permission(user, Permission.MARKS_DRAFT_PROMOTE, session_id, class_id, 0, section_id, self.mapping_repo):
+                raise ValueError("Insufficient permissions to promote drafts for this class")
+        
+        drafts = self.draft_repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        if not drafts:
+            return [], ["No drafts to promote"]
+        
+        marks_data = []
+        for draft in drafts:
+            marks_data.append({
+                "student_id": draft.student_id,
+                "subject_id": draft.subject_id,
+                "marks_obtained": draft.marks_obtained,
+                "status": "saved" if draft.marks_obtained is not None else draft.status,
+            })
+        
+        created, errors = self.bulk_save_marks(
+            session_id, class_id, section_id, exam_type_id, marks_data, user_id, user_name
+        )
+        
+        # Clear promoted drafts
+        for draft in drafts:
+            self.draft_repo.delete(draft)
+        
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        
+        return created, errors
+
+    def get_draft_vs_saved(
+        self,
+        student_id: int,
+        subject_id: int,
+        exam_type_id: int,
+    ) -> dict:
+        """Get draft and saved marks for comparison."""
+        draft = self.get_draft(student_id, subject_id, exam_type_id)
+        saved = self.get_marks_by_student_subject_exam(student_id, subject_id, exam_type_id)
+        
+        return {
+            "draft": {
+                "marks_obtained": draft.marks_obtained if draft else None,
+                "status": draft.status if draft else None,
+                "max_marks": draft.max_marks if draft else None,
+            } if draft else None,
+            "saved": {
+                "marks_obtained": saved.marks_obtained if saved else None,
+                "status": saved.status if saved else None,
+                "max_marks": saved.max_marks if saved else None,
+            } if saved else None,
+        }
+
+
+# ========================================================================
+# Authentication and RBAC
+# ========================================================================
+
+class Permission:
+    """Permission constants for RBAC."""
+    # Marks permissions
+    MARKS_VIEW = "marks:view"
+    MARKS_EDIT = "marks:edit"
+    MARKS_LOCK = "marks:lock"
+    MARKS_UNLOCK = "marks:unlock"
+    MARKS_DRAFT_SAVE = "marks:draft:save"
+    MARKS_DRAFT_RECOVER = "marks:draft:recover"
+    MARKS_DRAFT_DISCARD = "marks:draft:discard"
+    MARKS_DRAFT_PROMOTE = "marks:draft:promote"
+    MARKS_BULK_SAVE = "marks:bulk:save"
+    
+    # Audit permissions
+    AUDIT_VIEW = "audit:view"
+    AUDIT_EXPORT = "audit:export"
+    
+    # User management
+    USER_CREATE = "user:create"
+    USER_UPDATE = "user:update"
+    USER_DELETE = "user:delete"
+    USER_ASSIGN = "user:assign"
+    
+    # Report permissions
+    REPORT_APPROVE = "report:approve"
+    REPORT_VIEW_ALL = "report:view:all"
+    
+    # Admin permissions
+    ADMIN_ALL = "admin:*"
+
+
+# Role to permissions mapping
+ROLE_PERMISSIONS = {
+    "admin": {
+        Permission.ADMIN_ALL,
+        Permission.MARKS_VIEW,
+        Permission.MARKS_EDIT,
+        Permission.MARKS_LOCK,
+        Permission.MARKS_UNLOCK,
+        Permission.MARKS_DRAFT_SAVE,
+        Permission.MARKS_DRAFT_RECOVER,
+        Permission.MARKS_DRAFT_DISCARD,
+        Permission.MARKS_DRAFT_PROMOTE,
+        Permission.MARKS_BULK_SAVE,
+        Permission.AUDIT_VIEW,
+        Permission.AUDIT_EXPORT,
+        Permission.USER_CREATE,
+        Permission.USER_UPDATE,
+        Permission.USER_DELETE,
+        Permission.USER_ASSIGN,
+        Permission.REPORT_APPROVE,
+        Permission.REPORT_VIEW_ALL,
+    },
+    "principal": {
+        Permission.MARKS_VIEW,
+        Permission.MARKS_EDIT,
+        Permission.MARKS_LOCK,
+        Permission.MARKS_UNLOCK,
+        Permission.MARKS_DRAFT_SAVE,
+        Permission.MARKS_DRAFT_RECOVER,
+        Permission.MARKS_DRAFT_DISCARD,
+        Permission.MARKS_DRAFT_PROMOTE,
+        Permission.MARKS_BULK_SAVE,
+        Permission.AUDIT_VIEW,
+        Permission.AUDIT_EXPORT,
+        Permission.USER_ASSIGN,
+        Permission.REPORT_APPROVE,
+        Permission.REPORT_VIEW_ALL,
+    },
+    "teacher": {
+        Permission.MARKS_VIEW,
+        Permission.MARKS_EDIT,  # Only for assigned classes/subjects
+        Permission.MARKS_DRAFT_SAVE,
+        Permission.MARKS_DRAFT_RECOVER,  # Only for own drafts
+        Permission.MARKS_DRAFT_DISCARD,  # Only for own drafts
+    },
+}
+
+
+def get_permissions_for_role(role: str) -> set[str]:
+    """Get permissions for a role."""
+    return ROLE_PERMISSIONS.get(role, set())
+
+
+def user_has_permission(user: User, permission: str, session_id: int | None = None, class_id: int | None = None, subject_id: int | None = None) -> bool:
+    """Check if user has a specific permission, considering role and assignments."""
+    if not user or not user.is_active:
+        return False
+    
+    # Admin has all permissions
+    if user.role == "admin":
+        return True
+    
+    role_perms = get_permissions_for_role(user.role)
+    if permission not in role_perms:
+        return False
+    
+    # For teachers, check assignment for marks-related permissions
+    if user.role == "teacher" and permission in {
+        Permission.MARKS_EDIT,
+        Permission.MARKS_DRAFT_SAVE,
+        Permission.MARKS_DRAFT_RECOVER,
+        Permission.MARKS_DRAFT_DISCARD,
+    }:
+        if session_id is None or class_id is None or subject_id is None:
+            return False
+        # Check if teacher is assigned to this class/subject/session
+        mapping_repo = UserClassSubjectMappingRepository(user.session)  # Will need session passed
+        # This check will be done in service layer with proper session
+        return True  # Placeholder - actual check in service
+    
+    return True
+
+
+class AuthService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.user_repo = UserRepository(session)
+        self.mapping_repo = UserClassSubjectMappingRepository(session)
+
+    def authenticate(self, username: str, password: str) -> Optional[User]:
+        """Authenticate user with username and password."""
+        import hashlib
+        user = self.user_repo.get_by_username(username)
+        if not user or not user.is_active:
+            return None
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        if user.password_hash != password_hash:
+            return None
+        return user
+
+    def create_user(
+        self,
+        username: str,
+        email: str | None,
+        password: str,
+        full_name: str,
+        role: str = "teacher",
+        is_active: bool = True,
+    ) -> User:
+        """Create a new user."""
+        import hashlib
+        if role not in ("admin", "teacher", "principal"):
+            raise ValueError("Invalid role")
+        if self.user_repo.exists_by_username(username):
+            raise ValueError("Username already exists")
+        if email and self.user_repo.get_by_email(email):
+            raise ValueError("Email already exists")
+        
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        user = User(
+            username=username,
+            email=email,
+            password_hash=password_hash,
+            full_name=full_name,
+            role=role,
+            is_active=is_active,
+        )
+        try:
+            self.user_repo.add(user)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return user
+
+    def update_user(
+        self,
+        user_id: int,
+        username: str | None = None,
+        email: str | None = None,
+        full_name: str | None = None,
+        role: str | None = None,
+        is_active: bool | None = None,
+    ) -> User:
+        """Update user details."""
+        user = self.user_repo.get(user_id)
+        if not user:
+            raise ValueError("User not found")
+        
+        if username is not None:
+            if self.user_repo.exists_by_username(username, exclude_id=user_id):
+                raise ValueError("Username already exists")
+            user.username = username
+        if email is not None:
+            existing = self.user_repo.get_by_email(email)
+            if existing and existing.id != user_id:
+                raise ValueError("Email already exists")
+            user.email = email
+        if full_name is not None:
+            user.full_name = full_name
+        if role is not None:
+            if role not in ("admin", "teacher", "principal"):
+                raise ValueError("Invalid role")
+            user.role = role
+        if is_active is not None:
+            user.is_active = is_active
+        
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return user
+
+    def change_password(self, user_id: int, old_password: str, new_password: str) -> User:
+        """Change user password."""
+        import hashlib
+        user = self.user_repo.get(user_id)
+        if not user:
+            raise ValueError("User not found")
+        
+        old_hash = hashlib.sha256(old_password.encode()).hexdigest()
+        if user.password_hash != old_hash:
+            raise ValueError("Invalid current password")
+        
+        user.password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return user
+
+    def delete_user(self, user_id: int) -> bool:
+        """Delete a user."""
+        user = self.user_repo.get(user_id)
+        if not user:
+            raise ValueError("User not found")
+        
+        if user.role == "admin":
+            # Check if this is the last admin
+            admins = self.user_repo.list_by_role("admin")
+            if len(admins) <= 1:
+                raise ValueError("Cannot delete the last admin user")
+        
+        try:
+            self.mapping_repo.delete_by_user(user_id)
+            self.user_repo.delete(user)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return True
+
+    def assign_teacher(
+        self,
+        user_id: int,
+        class_id: int,
+        subject_id: int,
+        session_id: int,
+        section_id: int | None = None,
+        is_class_teacher: bool = False,
+    ) -> UserClassSubjectMapping:
+        """Assign a teacher to a class/subject."""
+        user = self.user_repo.get(user_id)
+        if not user:
+            raise ValueError("User not found")
+        if user.role != "teacher":
+            raise ValueError("Only teachers can be assigned to classes")
+        
+        # Check if already assigned
+        if self.mapping_repo.exists_for_user(user_id, class_id, subject_id, session_id, section_id):
+            raise ValueError("Teacher already assigned to this class/subject")
+        
+        mapping = UserClassSubjectMapping(
+            user_id=user_id,
+            class_id=class_id,
+            subject_id=subject_id,
+            session_id=session_id,
+            section_id=section_id,
+            is_class_teacher=is_class_teacher,
+        )
+        try:
+            self.mapping_repo.add(mapping)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return mapping
+
+    def unassign_teacher(self, mapping_id: int) -> bool:
+        """Remove a teacher assignment."""
+        mapping = self.mapping_repo.get(mapping_id)
+        if not mapping:
+            raise ValueError("Assignment not found")
+        try:
+            self.mapping_repo.delete(mapping)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return True
+
+    def get_teacher_assignments(self, user_id: int, session_id: int | None = None) -> List[UserClassSubjectMapping]:
+        """Get all assignments for a teacher."""
+        if session_id:
+            return self.mapping_repo.list_by_user_session(user_id, session_id)
+        return self.mapping_repo.list_by_user(user_id)
+
+    def is_teacher_assigned(self, user_id: int, class_id: int, subject_id: int, session_id: int, section_id: int | None = None) -> bool:
+        """Check if teacher is assigned to a specific class/subject/section."""
+        return self.mapping_repo.exists_for_user(user_id, class_id, subject_id, session_id, section_id)
+
+    def get_users_for_class_subject(self, class_id: int, subject_id: int, session_id: int) -> List[User]:
+        """Get all teachers assigned to a class/subject."""
+        mappings = self.mapping_repo.list_by_class_subject(class_id, subject_id, session_id)
+        user_ids = [m.user_id for m in mappings]
+        if not user_ids:
+            return []
+        return self.session.query(User).filter(User.id.in_(user_ids)).all()
+
+    def list_users(self, role: str | None = None) -> List[User]:
+        """List all users, optionally filtered by role."""
+        if role:
+            return self.user_repo.list_by_role(role)
+        return self.user_repo.list_all()
+
+
+# ========================================================================
+# Authorization helpers for MarksService
+# ========================================================================
+
+def _check_marks_permission(
+    user: User,
+    permission: str,
+    session_id: int,
+    class_id: int,
+    subject_id: int,
+    section_id: int | None,
+    mapping_repo: UserClassSubjectMappingRepository,
+) -> bool:
+    """Check if user has permission for a marks operation."""
+    if not user or not user.is_active:
+        return False
+    
+    # Admin has all permissions
+    if user.role == "admin":
+        return True
+    
+    # Check role permissions
+    role_perms = get_permissions_for_role(user.role)
+    if permission not in role_perms:
+        return False
+    
+    # For teachers, check assignment
+    if user.role == "teacher":
+        return mapping_repo.exists_for_user(user.id, class_id, subject_id, session_id, section_id)
+    
+    # Principal has all marks permissions
+    return True
+
+
+# ========================================================================
+# Component Marks Service
+# ========================================================================
+
+class ComponentMarksService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = ComponentMarksRepository(session)
+        self.component_repo = ExamComponentRepository(session)
+        self.student_repo = StudentRepository(session)
+        self.subject_repo = SubjectRepository(session)
+        self.exam_type_repo = ExamTypeRepository(session)
+        self.session_repo = SessionRepository(session)
+        self.class_repo = ClassRepository(session)
+        self.section_repo = SectionRepository(session)
+
+    # ------------------------------------------------------------------ writes
+
+    def save_component_marks(
+        self,
+        student_id: int,
+        component_id: int,
+        marks_obtained: int | None,
+        status: str = "saved",
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> ComponentMarks:
+        """Save or update marks for a student-component combination."""
+        if status not in ("pending", "absent", "saved", "locked"):
+            raise ValueError("Invalid status")
+        
+        student = self.student_repo.get(student_id)
+        if student is None:
+            raise ValueError("Student not found")
+        component = self.component_repo.get(component_id)
+        if component is None:
+            raise ValueError("Component not found")
+        
+        if marks_obtained is not None:
+            if marks_obtained < 0 or marks_obtained > component.max_marks:
+                raise ValueError(f"Marks must be between 0 and {component.max_marks}")
+        
+        existing = self.repo.get_by_student_component(student_id, component_id)
+        if existing:
+            if existing.status == "locked":
+                raise ValueError("Cannot modify locked marks")
+            
+            old_marks_obtained = str(existing.marks_obtained) if existing.marks_obtained is not None else None
+            old_status = existing.status
+            
+            existing.marks_obtained = marks_obtained
+            existing.max_marks = component.max_marks
+            existing.status = status
+            existing.session_id = student.session_id
+            existing.class_id = student.class_id
+            existing.section_id = student.section_id
+            try:
+                self.session.commit()
+                
+                if old_marks_obtained != (str(marks_obtained) if marks_obtained is not None else None) or old_status != status:
+                    self._log_audit(
+                        component_marks=existing,
+                        field_changed="marks_obtained,status",
+                        old_value=old_marks_obtained,
+                        new_value=str(marks_obtained) if marks_obtained is not None else None,
+                        old_status=old_status,
+                        new_status=status,
+                        action="update",
+                        user_id=user_id,
+                        user_name=user_name,
+                        component_name=component.name,
+                        component_code=component.code,
+                    )
+                    self.session.commit()
+            except Exception:
+                self.session.rollback()
+                raise
+            self._refresh_dependent_marks(student_id, component_id, user_id, user_name)
+            return existing
+        
+        # Check for missing source marks (PT1) when entering PT2 marks
+        if component.code == "PT2":
+            hy_exam_type = self.exam_type_repo.get_by_name("Half Yearly")
+            if hy_exam_type:
+                pt1_comp = self.component_repo.get_by_exam_type_and_subject(hy_exam_type.id, component.subject_id)
+                pt1_comp = next((c for c in pt1_comp if c.code == "PT1"), None)
+                if pt1_comp:
+                    pt1_marks = self.repo.get_by_student_component(student_id, pt1_comp.id)
+                    if pt1_marks is None or pt1_marks.marks_obtained is None:
+                        raise ValueError(f"Cannot enter PT2 marks: PT1 marks for {component.subject.name if component.subject else 'this subject'} are missing. Enter PT1 marks first.")
+        
+        comp_marks = ComponentMarks(
+            student_id=student_id,
+            subject_id=component.subject_id or 0,
+            exam_type_id=component.exam_type_id,
+            component_id=component_id,
+            session_id=student.session_id,
+            class_id=student.class_id,
+            section_id=student.section_id,
+            marks_obtained=marks_obtained,
+            max_marks=component.max_marks,
+            status=status,
+        )
+        try:
+            self.repo.add(comp_marks)
+            self.session.flush()
+            
+            self._log_audit(
+                component_marks=comp_marks,
+                field_changed="marks_obtained,status",
+                old_value=None,
+                new_value=str(marks_obtained) if marks_obtained is not None else None,
+                old_status=None,
+                new_status=status,
+                action="insert",
+                user_id=user_id,
+                user_name=user_name,
+                component_name=component.name,
+                component_code=component.code,
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        self._refresh_dependent_marks(student_id, component_id, user_id, user_name)
+        return comp_marks
+
+    def bulk_save_component_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        marks_data: List[dict],
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> Tuple[List[ComponentMarks], List[str]]:
+        """Bulk save component marks from list of dicts."""
+        components = self.component_repo.get_by_exam_type(exam_type_id)
+        if not components:
+            raise ValueError("No components found for this exam type")
+        
+        created = []
+        errors = []
+        for idx, data in enumerate(marks_data):
+            student_id = data.get("student_id")
+            component_id = data.get("component_id")
+            marks_obtained = data.get("marks_obtained")
+            status = data.get("status", "saved")
+            
+            if student_id is None or component_id is None:
+                errors.append(f"Row {idx + 1}: Missing student_id or component_id")
+                continue
+            
+            student = self.student_repo.get(student_id)
+            if student is None:
+                errors.append(f"Row {idx + 1}: Student not found")
+                continue
+            if student.session_id != session_id or student.class_id != class_id or student.section_id != section_id:
+                errors.append(f"Row {idx + 1}: Student not in selected session/class/section")
+                continue
+            
+            component = self.component_repo.get(component_id)
+            if component is None:
+                errors.append(f"Row {idx + 1}: Component not found")
+                continue
+            
+            if marks_obtained is not None:
+                if marks_obtained < 0 or marks_obtained > component.max_marks:
+                    errors.append(f"Row {idx + 1}: Marks must be between 0 and {component.max_marks}")
+                    continue
+            
+            try:
+                marks = self.save_component_marks(student_id, component_id, marks_obtained, status, user_id, user_name)
+                created.append(marks)
+            except ValueError as exc:
+                errors.append(f"Row {idx + 1}: {exc}")
+        
+        return created, errors
+
+    def lock_component_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> int:
+        marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for marks in marks_list:
+            if marks.status in ("saved", "pending"):
+                old_status = marks.status
+                marks.status = "locked"
+                count += 1
+                try:
+                    self.session.commit()
+                    
+                    self._log_audit(
+                        component_marks=marks,
+                        field_changed="status",
+                        old_value=None,
+                        new_value=None,
+                        old_status=old_status,
+                        new_status="locked",
+                        action="lock",
+                        user_id=user_id,
+                        user_name=user_name,
+                    )
+                    self.session.commit()
+                except Exception:
+                    self.session.rollback()
+                    raise
+        return count
+
+    def unlock_component_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+        user_id: int | None = None,
+        user_name: str | None = None,
+    ) -> int:
+        marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for marks in marks_list:
+            if marks.status == "locked":
+                old_status = marks.status
+                marks.status = "saved"
+                count += 1
+                try:
+                    self.session.commit()
+                    
+                    self._log_audit(
+                        component_marks=marks,
+                        field_changed="status",
+                        old_value=None,
+                        new_value=None,
+                        old_status=old_status,
+                        new_status="saved",
+                        action="unlock",
+                        user_id=user_id,
+                        user_name=user_name,
+                    )
+                    self.session.commit()
+                except Exception:
+                    self.session.rollback()
+                    raise
+        return count
+
+    def discard_component_marks(self, student_id: int, component_id: int) -> bool:
+        """Discard a student-component marks record (pending/unsaved). Returns True if deleted."""
+        marks = self.repo.get_by_student_component(student_id, component_id)
+        if marks is None:
+            return False
+        try:
+            self.repo.delete(marks)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return True
+
+    def discard_all_drafts(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+    ) -> int:
+        """Discard all pending (unsaved) component marks for a session/class/section/exam. Returns count deleted."""
+        marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for marks in marks_list:
+            if marks.status == "pending":
+                self.repo.delete(marks)
+                count += 1
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return count
+
+    def promote_drafts_to_marks(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+    ) -> int:
+        """Promote all pending (unsaved) component marks for a section+exam to 'saved'. Returns count promoted."""
+        marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        count = 0
+        for marks in marks_list:
+            if marks.status == "pending":
+                marks.status = "saved"
+                count += 1
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return count
+
+    # ------------------------------------------------------------------ reads
+
+    def get_component_marks(self, component_marks_id: int) -> Optional[ComponentMarks]:
+        return self.repo.get(component_marks_id)
+
+    def get_component_marks_by_student_component(
+        self,
+        student_id: int,
+        component_id: int,
+    ) -> Optional[ComponentMarks]:
+        return self.repo.get_by_student_component(student_id, component_id)
+
+    def list_component_marks_for_entry(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+    ) -> List[ComponentMarks]:
+        return self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+
+    def list_component_marks_by_student(self, student_id: int) -> List[ComponentMarks]:
+        return self.repo.list_by_student(student_id)
+
+    def list_component_marks_by_student_exam(self, student_id: int, exam_type_id: int) -> List[ComponentMarks]:
+        return self.repo.list_by_student_exam(student_id, exam_type_id)
+
+    def _log_audit(
+        self,
+        component_marks: ComponentMarks,
+        field_changed: str,
+        old_value: str | None,
+        new_value: str | None,
+        old_status: str | None,
+        new_status: str | None,
+        action: str,
+        user_id: int | None = None,
+        user_name: str | None = None,
+        component_name: str | None = None,
+        component_code: str | None = None,
+        conversion_applied: bool = False,
+        conversion_formula: str | None = None,
+    ) -> MarksAuditLog:
+        """Create an audit log entry for a component marks change with component-specific details."""
+        audit = MarksAuditLog(
+            marks_id=component_marks.id,
+            student_id=component_marks.student_id,
+            subject_id=component_marks.subject_id,
+            exam_type_id=component_marks.exam_type_id,
+            session_id=component_marks.session_id,
+            class_id=component_marks.class_id,
+            section_id=component_marks.section_id,
+            field_changed=field_changed,
+            old_value=old_value,
+            new_value=new_value,
+            old_status=old_status,
+            new_status=new_status,
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+        )
+        # Add component-specific audit info in the field_changed or as JSON in a custom field
+        # For now, store component-specific info in the field_changed and old/new values
+        if component_marks.component:
+            audit.field_changed = f"{component_marks.component.code}: {field_changed}"
+            if component_name:
+                audit.old_value = f"[{component_name}] {old_value or ''}"
+                audit.new_value = f"[{component_name}] {new_value or ''}"
+        
+        # Store conversion info in old_value/new_value if conversion was applied
+        if conversion_applied and conversion_formula:
+            audit.old_value = f"{audit.old_value or ''} | Conversion: {conversion_formula}"
+        
+        from repositories import MarksAuditLogRepository
+        audit_repo = MarksAuditLogRepository(self.session)
+        audit_repo.add(audit)
+        return audit
+
+    def _upsert_converted_marks(
+        self,
+        student_id: int,
+        target_component: ExamComponent,
+        source_marks: ComponentMarks,
+        source_component: ExamComponent,
+        converted_obtained: int,
+    ) -> None:
+        """Create or update a converted (auto-calculated) marks record on a target component."""
+        existing = self.repo.get_by_student_component(student_id, target_component.id)
+
+        if existing:
+            # Only refresh if target marks are not manually entered
+            if existing.status not in ("pending", "converted"):
+                return
+            old_marks = str(existing.marks_obtained) if existing.marks_obtained is not None else None
+            old_status = existing.status
+            existing.marks_obtained = converted_obtained
+            existing.max_marks = target_component.max_marks
+            existing.status = "converted"
+            existing.session_id = source_marks.session_id
+            existing.class_id = source_marks.class_id
+            existing.section_id = source_marks.section_id
+
+            self._log_audit(
+                component_marks=existing,
+                field_changed="marks_obtained,status",
+                old_value=old_marks,
+                new_value=str(converted_obtained),
+                old_status=old_status,
+                new_status="converted",
+                action="auto_refresh",
+                user_id=None,
+                user_name="System (PT1 auto-refresh)",
+                component_name=target_component.name,
+                component_code=target_component.code,
+                conversion_applied=True,
+                conversion_formula=f"PT1 ({source_marks.marks_obtained}/{source_component.max_marks}) * 5 = {converted_obtained}/{target_component.max_marks}",
+            )
+        else:
+            comp_marks = ComponentMarks(
+                student_id=student_id,
+                subject_id=target_component.subject_id or 0,
+                exam_type_id=target_component.exam_type_id,
+                component_id=target_component.id,
+                session_id=source_marks.session_id,
+                class_id=source_marks.class_id,
+                section_id=source_marks.section_id,
+                marks_obtained=converted_obtained,
+                max_marks=target_component.max_marks,
+                status="converted",
+            )
+            self.repo.add(comp_marks)
+            self.session.flush()
+
+            self._log_audit(
+                component_marks=comp_marks,
+                field_changed="marks_obtained,status",
+                old_value=None,
+                new_value=str(converted_obtained),
+                old_status=None,
+                new_status="converted",
+                action="auto_refresh",
+                user_id=None,
+                user_name="System (PT1 auto-refresh)",
+                component_name=target_component.name,
+                component_code=target_component.code,
+                conversion_applied=True,
+                conversion_formula=f"PT1 ({source_marks.marks_obtained}/{source_component.max_marks}) * 5 = {converted_obtained}/{target_component.max_marks}",
+            )
+
+    def _refresh_dependent_marks(self, student_id: int, source_component_id: int, user_id: int | None = None, user_name: str | None = None) -> None:
+        """Refresh dependent marks when source marks are updated.
+
+        Handles PT1 exam-type marks → Half Yearly PT1 component (auto-converted, read-only)
+        and PT1 exam-type marks → Annual PT2 component.
+        """
+        source_component = self.component_repo.get(source_component_id)
+        if not source_component or source_component.code != "PT1":
+            return
+
+        # Check if source component is from PT1 exam type (not Half Yearly/Annual PT1)
+        source_exam_type = self.exam_type_repo.get(source_component.exam_type_id)
+        if not source_exam_type or source_exam_type.name != "PT1":
+            return
+
+        # Get source PT1 marks
+        source_marks = self.repo.get_by_student_component(student_id, source_component_id)
+        if not source_marks or source_marks.marks_obtained is None:
+            return
+
+        # Calculate converted marks: pt1_obtained / 25 * 5 = pt1_obtained / 5
+        converted_obtained = round(source_marks.marks_obtained * 5 / source_component.max_marks)
+
+        # --- Half Yearly PT1 component (read-only auto-calculated) ---
+        hy_exam_type = self.exam_type_repo.get_by_name("Half Yearly")
+        if hy_exam_type:
+            hy_pt1_components = self.component_repo.get_by_exam_type_and_subject(
+                hy_exam_type.id, source_component.subject_id
+            )
+            hy_pt1_component = next((c for c in hy_pt1_components if c.code == "PT1"), None)
+            if hy_pt1_component:
+                self._upsert_converted_marks(
+                    student_id=student_id,
+                    target_component=hy_pt1_component,
+                    source_marks=source_marks,
+                    source_component=source_component,
+                    converted_obtained=converted_obtained,
+                )
+
+        # --- Annual PT2 component (existing behavior) ---
+        annual_exam_type = self.exam_type_repo.get_by_name("Annual")
+        if annual_exam_type:
+            pt2_component = self.component_repo.get_by_exam_type_and_subject(
+                annual_exam_type.id, source_component.subject_id
+            )
+            pt2_component = next((c for c in pt2_component if c.code == "PT2"), None)
+            if pt2_component:
+                self._upsert_converted_marks(
+                    student_id=student_id,
+                    target_component=pt2_component,
+                    source_marks=source_marks,
+                    source_component=source_component,
+                    converted_obtained=converted_obtained,
+                )
+
+        self.session.commit()
+
+    def get_student_component_summary(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        exam_type_id: int,
+    ) -> List[dict]:
+        """Get component marks summary for all students in a section."""
+        students = self.student_repo.list_active_by_section(session_id, class_id, section_id)
+        components = self.component_repo.get_by_exam_type(exam_type_id)
+        
+        if not components:
+            return []
+        
+        # Get all component marks for this section/exam
+        marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, exam_type_id)
+        marks_lookup = {(m.student_id, m.component_id): m for m in marks_list}
+        
+        # Get PT1 components for Half Yearly exam (for PT1→PT2 conversion)
+        # Only applies when computing Annual exam summary
+        hy_exam_type = self.exam_type_repo.get_by_name("Half Yearly")
+        pt1_components = []
+        hy_marks_lookup = {}
+        if hy_exam_type:
+            hy_components = self.component_repo.get_by_exam_type(hy_exam_type.id)
+            pt1_components = [c for c in hy_components if c.code == "PT1"]
+            # Also fetch Half Yearly marks for PT1 conversion
+            hy_marks_list = self.repo.list_by_section_exam(session_id, class_id, section_id, hy_exam_type.id)
+            hy_marks_lookup = {(m.student_id, m.component_id): m for m in hy_marks_list}
+        
+        result = []
+        for student in students:
+            student_data = {
+                "student_id": student.id,
+                "roll_number": student.roll_number,
+                "name": student.name,
+                "components": [],
+                "total_obtained": 0,
+                "total_max": 0,
+            }
+            for component in components:
+                key = (student.id, component.id)
+                marks = marks_lookup.get(key)
+                obtained = marks.marks_obtained if marks else None
+                status = marks.status if marks else "pending"
+                status = marks.status if marks else "pending"
+                
+                # PT2 conversion for Annual exam
+                # Annual PT2/5 must derive from the student's original PT2 paper marks (obtained/original maximum × 5)
+                # Never substitute PT1 for missing PT2
+                converted_obtained = obtained
+                converted_status = status
+                is_converted = False
+                
+                if (exam_type_id == (self.exam_type_repo.get_by_name("Annual").id if self.exam_type_repo.get_by_name("Annual") else None)
+                    and component.code == "PT2"
+                    and (obtained is None or status == "pending")):
+                    # Find corresponding PT2 original component for this subject
+                    pt2_original_comp = next((c for c in components if c.code == "PT2" and c.subject_id == component.subject_id), None)
+                    if pt2_original_comp:
+                        pt2_original_key = (student.id, pt2_original_comp.id)
+                        pt2_original_marks = marks_lookup.get(pt2_original_key)
+                        if pt2_original_marks and pt2_original_marks.marks_obtained is not None:
+                            # Convert: obtained ÷ original_max × 5
+                            converted_obtained = round(pt2_original_marks.marks_obtained * 5 / pt2_original_comp.max_marks)
+                            converted_status = "converted"
+                            is_converted = True
+                            # Mark that conversion was applied
+                            if marks is not None and marks.marks_obtained is not None:
+                                # Manual entry exists - don't override
+                                converted_obtained = obtained
+                                converted_status = status
+                                is_converted = False
+                
+                # French written marks: explicitly distinguish raw marks out of 40 from equivalent marks out of 80
+                french_equivalent = None
+                french_raw_marks = None
+                if component.code == "WE" and component.subject:
+                    subject_name = component.subject.name.upper()
+                    if subject_name == "FRENCH" and component.max_marks == 80:
+                        if obtained is not None:
+                            # Store raw marks as entered (out of 40 or 80)
+                            french_raw_marks = obtained
+                            # If user entered marks out of 40 (value <= 40), convert to 80 equivalent
+                            # Only convert if value <= 40 (user entered out of 40)
+                            if obtained <= 40:
+                                french_equivalent = obtained * 2
+                            else:
+                                # Value > 40 assumed to be already out of 80
+                                french_equivalent = obtained
+                
+                # GK grade-only handling
+                is_gk = component.subject and component.subject.name.upper() == "GK"
+                gk_grade = None
+                exclude_from_totals = False
+                if is_gk:
+                    exclude_from_totals = True
+                    if obtained is not None:
+                        # Convert raw marks to percentage first
+                        # Use max 25 for PT1/PT2, max 40 for Half Yearly/Annual components
+                        if component.code in ("PT", "PT1", "PT2"):
+                            max_for_percentage = 25
+                        else:
+                            max_for_percentage = 40
+                        
+                        if max_for_percentage > 0:
+                            percentage = round((obtained / max_for_percentage) * 100)
+                        else:
+                            percentage = 0
+                        
+                        # Apply approved grade scale: A1 ≥91, A2 ≥81, B1 ≥71, B2 ≥61, C1 ≥51, C2 ≥41, D ≥33, else E
+                        if percentage >= 91:
+                            gk_grade = "A1"
+                        elif percentage >= 81:
+                            gk_grade = "A2"
+                        elif percentage >= 71:
+                            gk_grade = "B1"
+                        elif percentage >= 61:
+                            gk_grade = "B2"
+                        elif percentage >= 51:
+                            gk_grade = "C1"
+                        elif percentage >= 41:
+                            gk_grade = "C2"
+                        elif percentage >= 33:
+                            gk_grade = "D"
+                        else:
+                            gk_grade = "E"
+                        
+                        # Exclude from totals
+                        obtained_for_total = None
+                else:
+                    obtained_for_total = obtained
+                
+                component_data = {
+                    "component_id": component.id,
+                    "component_name": component.name,
+                    "component_code": component.code,
+                    "max_marks": component.max_marks,
+                    "marks_obtained": converted_obtained if converted_obtained is not None else obtained,
+                    "status": converted_status,
+                    "is_converted": is_converted,
+                }
+                
+                if french_equivalent is not None:
+                    component_data["french_equivalent_80"] = french_equivalent
+                if gk_grade is not None:
+                    component_data["gk_grade"] = gk_grade
+                if exclude_from_totals:
+                    component_data["exclude_from_totals"] = True
+                
+                student_data["components"].append(component_data)
+                
+                if obtained_for_total is not None:
+                    student_data["total_obtained"] += obtained_for_total
+                    student_data["total_max"] += component.max_marks
+            
+            result.append(student_data)
+        
+        return result
+
+    # ------------------------------------------------------------------ PT1 Result
+
+    @staticmethod
+    def _calculate_grade(percentage: float) -> str:
+        """Calculate grade from percentage using approved scale."""
+        if percentage >= 91:
+            return "A1"
+        elif percentage >= 81:
+            return "A2"
+        elif percentage >= 71:
+            return "B1"
+        elif percentage >= 61:
+            return "B2"
+        elif percentage >= 51:
+            return "C1"
+        elif percentage >= 41:
+            return "C2"
+        elif percentage >= 33:
+            return "D"
+        else:
+            return "E"
+
+    def get_pt1_result_summary(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> List[dict]:
+        """Get PT1 result summary for all active students in a section for a subject.
+
+        Returns one dict per student with:
+        - roll_number, admission_number, name
+        - max_marks, obtained_marks, percentage (2 decimals), grade, status
+        - Pending marks stay blank (None); Absent is preserved as a status.
+        """
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        students = self.student_repo.list_active_by_section(
+            session_id, class_id, section_id
+        )
+        components = self.component_repo.get_by_exam_type_and_subject(
+            pt1_exam_type.id, subject_id
+        )
+        if not components:
+            return []
+
+        marks_list = self.repo.list_by_section_exam(
+            session_id, class_id, section_id, pt1_exam_type.id
+        )
+        marks_lookup = {(m.student_id, m.component_id): m for m in marks_list}
+
+        result = []
+        for student in students:
+            max_marks = sum(c.max_marks for c in components)
+            obtained_total = 0
+            has_all_marks = True
+            student_status = "pending"
+
+            for comp in components:
+                marks = marks_lookup.get((student.id, comp.id))
+                if marks:
+                    if marks.status == "absent":
+                        student_status = "absent"
+                        has_all_marks = False
+                        break
+                    if marks.marks_obtained is not None:
+                        obtained_total += marks.marks_obtained
+                    else:
+                        has_all_marks = False
+                else:
+                    has_all_marks = False
+
+            if not has_all_marks:
+                obtained = None
+                percentage = None
+                grade = None
+            else:
+                obtained = obtained_total
+                percentage = round((obtained / max_marks) * 100, 2) if max_marks > 0 else 0.0
+                grade = self._calculate_grade(percentage)
+
+            result.append({
+                "student_id": student.id,
+                "roll_number": student.roll_number,
+                "admission_number": student.admission_number,
+                "name": student.name,
+                "max_marks": max_marks,
+                "obtained_marks": obtained,
+                "percentage": percentage,
+                "grade": grade,
+                "status": student_status,
+            })
+
+        return result
+
+    def export_pt1_results_to_csv(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> str:
+        """Export PT1 result summary to CSV format."""
+        import csv
+        from io import StringIO
+
+        results = self.get_pt1_result_summary(
+            session_id, class_id, section_id, subject_id
+        )
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Roll Number", "Admission Number", "Student Name",
+            "Max Marks", "Obtained Marks", "Percentage", "Grade", "Status"
+        ])
+        for r in results:
+            writer.writerow([
+                r["roll_number"],
+                r["admission_number"],
+                r["name"],
+                r["max_marks"],
+                r["obtained_marks"] if r["obtained_marks"] is not None else "",
+                f"{r['percentage']:.2f}" if r["percentage"] is not None else "",
+                r["grade"] if r["grade"] else "",
+                r["status"],
+            ])
+
+        return output.getvalue()
+
+    def get_pt1_subjects_for_class_section(
+        self, class_id: int, section_id: int
+    ) -> List:
+        """Get subjects that have PT1 components for a class+section."""
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        subjects = self.subject_repo.list_active()
+        result = []
+        for subj in subjects:
+            comps = self.component_repo.get_by_exam_type_and_subject(
+                pt1_exam_type.id, subj.id
+            )
+            if comps:
+                result.append(subj)
+        return result
+
+    # ------------------------------------------------------------------ PT1 Result
+
+    @staticmethod
+    def _calculate_grade(percentage: float) -> str:
+        """Calculate grade from percentage using approved scale."""
+        if percentage >= 91:
+            return "A1"
+        elif percentage >= 81:
+            return "A2"
+        elif percentage >= 71:
+            return "B1"
+        elif percentage >= 61:
+            return "B2"
+        elif percentage >= 51:
+            return "C1"
+        elif percentage >= 41:
+            return "C2"
+        elif percentage >= 33:
+            return "D"
+        else:
+            return "E"
+
+    def get_pt1_result_summary(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> List[dict]:
+        """Get PT1 result summary for all active students in a section for a subject.
+
+        Returns one dict per student with:
+        - roll_number, admission_number, name
+        - max_marks, obtained_marks, percentage (2 decimals), grade, status
+        - Pending marks stay blank (None); Absent is preserved as a status.
+        """
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        students = self.student_repo.list_active_by_section(
+            session_id, class_id, section_id
+        )
+        components = self.component_repo.get_by_exam_type_and_subject(
+            pt1_exam_type.id, subject_id
+        )
+        if not components:
+            return []
+
+        marks_list = self.repo.list_by_section_exam(
+            session_id, class_id, section_id, pt1_exam_type.id
+        )
+        marks_lookup = {}
+        for m in marks_list:
+            if m.component_id in [c.id for c in components]:
+                marks_lookup[m.student_id] = m
+
+        result = []
+        for student in students:
+            max_marks = sum(c.max_marks for c in components)
+            obtained_total = 0
+            has_all_marks = True
+            student_status = "pending"
+
+            for comp in components:
+                marks = marks_lookup.get((student.id, comp.id))
+                if marks:
+                    if marks.status == "absent":
+                        student_status = "absent"
+                        has_all_marks = False
+                        break
+                    if marks.marks_obtained is not None:
+                        obtained_total += marks.marks_obtained
+                    else:
+                        has_all_marks = False
+                else:
+                    has_all_marks = False
+
+            if not has_all_marks:
+                obtained = None
+                percentage = None
+                grade = None
+            else:
+                obtained = obtained_total
+                percentage = round((obtained / max_marks) * 100, 2) if max_marks > 0 else 0.0
+                grade = self._calculate_grade(percentage)
+
+            result.append({
+                "student_id": student.id,
+                "roll_number": student.roll_number,
+                "admission_number": student.admission_number,
+                "name": student.name,
+                "max_marks": max_marks,
+                "obtained_marks": obtained,
+                "percentage": percentage,
+                "grade": grade,
+                "status": student_status,
+            })
+
+        return result
+
+    def export_pt1_results_to_csv(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> str:
+        """Export PT1 result summary to CSV format."""
+        import csv
+        from io import StringIO
+
+        results = self.get_pt1_result_summary(
+            session_id, class_id, section_id, subject_id
+        )
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Roll Number", "Admission Number", "Student Name",
+            "Max Marks", "Obtained Marks", "Percentage", "Grade", "Status"
+        ])
+        for r in results:
+            writer.writerow([
+                r["roll_number"],
+                r["admission_number"],
+                r["name"],
+                r["max_marks"],
+                r["obtained_marks"] if r["obtained_marks"] is not None else "",
+                f"{r['percentage']:.2f}" if r["percentage"] is not None else "",
+                r["grade"] if r["grade"] else "",
+                r["status"],
+            ])
+
+        return output.getvalue()
+
+    def get_pt1_subjects_for_class_section(
+        self, class_id: int, section_id: int
+    ) -> List:
+        """Get subjects that have PT1 components for a class+section."""
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        subjects = self.subject_repo.list_active()
+        result = []
+        for subj in subjects:
+            comps = self.component_repo.get_by_exam_type_and_subject(
+                pt1_exam_type.id, subj.id
+            )
+            if comps:
+                result.append(subj)
+    def get_pt1_result_summary(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> List[dict]:
+        """Get PT1 result summary for all active students in a section for a subject.
+
+        Returns one dict per student with:
+        - roll_number, admission_number, name
+        - max_marks, obtained_marks, percentage (2 decimals), grade, status
+        - Pending marks stay blank (None); Absent is preserved as a status.
+        """
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        students = self.student_repo.list_active_by_section(
+            session_id, class_id, section_id
+        )
+        components = self.component_repo.get_by_exam_type_and_subject(
+            pt1_exam_type.id, subject_id
+        )
+        if not components:
+            return []
+
+        marks_list = self.repo.list_by_section_exam(
+            session_id, class_id, section_id, pt1_exam_type.id
+        )
+        marks_lookup = {}
+        for m in marks_list:
+            if m.component_id in [c.id for c in components]:
+                marks_lookup[(m.student_id, m.component_id)] = m
+
+        result = []
+        for student in students:
+            max_marks = sum(c.max_marks for c in components)
+            obtained_total = 0
+            has_all_marks = True
+
+            for comp in components:
+                marks = marks_lookup.get((student.id, comp.id))
+                if marks:
+                    if marks.status == "absent":
+                        has_all_marks = False
+                    elif marks.marks_obtained is not None:
+                        obtained_total += marks.marks_obtained
+                    else:
+                        has_all_marks = False
+                else:
+                    has_all_marks = False
+
+            if not has_all_marks:
+                obtained = None
+                percentage = None
+                grade = None
+                status = "pending"
+            else:
+                obtained = obtained_total
+                percentage = round((obtained / max_marks) * 100, 2) if max_marks > 0 else 0.0
+                grade = self._calculate_grade(percentage)
+                status = "saved"
+
+            result.append({
+                "student_id": student.id,
+                "roll_number": student.roll_number,
+                "admission_number": student.admission_number,
+                "name": student.name,
+                "max_marks": max_marks,
+                "obtained_marks": obtained,
+                "percentage": percentage,
+                "grade": grade,
+                "status": status,
+            })
+
+        return result
+
+    def export_pt1_results_to_csv(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> str:
+        """Export PT1 result summary to CSV format."""
+        import csv
+        from io import StringIO
+
+        results = self.get_pt1_result_summary(
+            session_id, class_id, section_id, subject_id
+        )
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Roll Number", "Admission Number", "Student Name",
+            "Max Marks", "Obtained Marks", "Percentage", "Grade", "Status"
+        ])
+        for r in results:
+            writer.writerow([
+                r["roll_number"],
+                r["admission_number"],
+                r["name"],
+                r["max_marks"],
+                r["obtained_marks"] if r["obtained_marks"] is not None else "",
+                f"{r['percentage']:.2f}" if r["percentage"] is not None else "",
+                r["grade"] if r["grade"] else "",
+                r["status"],
+            ])
+
+        return output.getvalue()
+
+    def get_pt1_subjects_for_class_section(
+        self, class_id: int, section_id: int
+    ) -> List:
+        """Get subjects that have PT1 components for a class+section."""
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        subjects = self.subject_repo.list_active()
+        result = []
+        for subj in subjects:
+            comps = self.component_repo.get_by_exam_type_and_subject(
+                pt1_exam_type.id, subj.id
+            )
+            if comps:
+                result.append(subj)
+    def get_pt1_result_summary(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> List[dict]:
+        """Get PT1 result summary for all active students in a section for a subject.
+
+        Returns one dict per student with:
+        - roll_number, admission_number, name
+        - max_marks, obtained_marks, percentage (2 decimals), grade, status
+        - Pending marks stay blank (None); Absent is preserved as a status.
+        """
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        students = self.student_repo.list_active_by_section(
+            session_id, class_id, section_id
+        )
+        components = self.component_repo.get_by_exam_type_and_subject(
+            pt1_exam_type.id, subject_id
+        )
+        if not components:
+            return []
+
+        marks_list = self.repo.list_by_section_exam(
+            session_id, class_id, section_id, pt1_exam_type.id
+        )
+        marks_lookup = {(m.student_id, m.component_id): m for m in marks_list}
+
+        result = []
+        for student in students:
+            max_marks = sum(c.max_marks for c in components)
+            obtained_total = 0
+            has_all_marks = True
+            student_status = "pending"
+
+            for comp in components:
+                marks = marks_lookup.get((student.id, comp.id))
+                if marks:
+                    if marks.status == "absent":
+                        student_status = "absent"
+                    elif marks.marks_obtained is not None:
+                        obtained_total += marks.marks_obtained
+                    else:
+                        has_all_marks = False
+                else:
+                    has_all_marks = False
+
+            if student_status == "absent":
+                obtained = None
+                percentage = None
+                grade = None
+            elif not has_all_marks:
+                obtained = None
+                percentage = None
+                grade = None
+            else:
+                obtained = obtained_total
+                percentage = round((obtained / max_marks) * 100, 2) if max_marks > 0 else 0.0
+                grade = self._calculate_grade(percentage)
+                if student_status == "pending":
+                    student_status = "saved"
+
+            result.append({
+                "student_id": student.id,
+                "roll_number": student.roll_number,
+                "admission_number": student.admission_number,
+                "name": student.name,
+                "max_marks": max_marks,
+                "obtained_marks": obtained,
+                "percentage": percentage,
+                "grade": grade,
+                "status": student_status,
+            })
+
+        return result
+
+    def export_pt1_results_to_csv(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> str:
+        """Export PT1 result summary to CSV format."""
+        import csv
+        from io import StringIO
+
+        results = self.get_pt1_result_summary(
+            session_id, class_id, section_id, subject_id
+        )
+
+        output = StringIO()
+        writer = csv.writer(output, lineterminator="\n")
+        writer.writerow([
+            "Roll Number", "Admission Number", "Student Name",
+            "Max Marks", "Obtained Marks", "Percentage", "Grade", "Status"
+        ])
+        for r in results:
+            writer.writerow([
+                r["roll_number"],
+                r["admission_number"],
+                r["name"],
+                r["max_marks"],
+                r["obtained_marks"] if r["obtained_marks"] is not None else "",
+                f"{r['percentage']:.2f}" if r["percentage"] is not None else "",
+                r["grade"] if r["grade"] else "",
+                r["status"],
+            ])
+
+        return output.getvalue()
+
+    def get_pt1_subjects_for_class_section(
+        self, class_id: int, section_id: int
+    ) -> List:
+        """Get subjects that have PT1 components for a class+section."""
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        subjects = self.subject_repo.list_active()
+        result = []
+        for subj in subjects:
+            comps = self.component_repo.get_by_exam_type_and_subject(
+                pt1_exam_type.id, subj.id
+            )
+            if comps:
+                result.append(subj)
+        return result
+
+    # ------------------------------------------------------------------ audit
+
+    def _log_audit(
+        self,
+        component_marks: ComponentMarks,
+        field_changed: str,
+        old_value: str | None,
+        new_value: str | None,
+        old_status: str | None,
+        new_status: str | None,
+        action: str,
+        user_id: int | None = None,
+        user_name: str | None = None,
+        component_name: str | None = None,
+        component_code: str | None = None,
+        conversion_applied: bool = False,
+        conversion_formula: str | None = None,
+    ) -> MarksAuditLog:
+        """Create an audit log entry for a component marks change with component-specific details."""
+        audit = MarksAuditLog(
+            marks_id=component_marks.id,
+            student_id=component_marks.student_id,
+            subject_id=component_marks.subject_id,
+            exam_type_id=component_marks.exam_type_id,
+            session_id=component_marks.session_id,
+            class_id=component_marks.class_id,
+            section_id=component_marks.section_id,
+            field_changed=field_changed,
+            old_value=old_value,
+            new_value=new_value,
+            old_status=old_status,
+            new_status=new_status,
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+        )
+        # Add component-specific audit info in the field_changed or as JSON in a custom field
+        # For now, store component-specific info in the field_changed and old/new values
+        if component_marks.component:
+            audit.field_changed = f"{component_marks.component.code}: {field_changed}"
+            if component_name:
+                audit.old_value = f"[{component_name}] {old_value or ''}"
+                audit.new_value = f"[{component_name}] {new_value or ''}"
+        
+        # Store conversion info in old_value/new_value if conversion was applied
+        if conversion_applied and conversion_formula:
+            audit.old_value = f"{audit.old_value or ''} | Conversion: {conversion_formula}"
+        
+        from repositories import MarksAuditLogRepository
+        audit_repo = MarksAuditLogRepository(self.session)
+        audit_repo.add(audit)
+        return audit
+
+        return result
+
+    def export_pt1_results_to_csv(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> str:
+        """Export PT1 result summary to CSV format."""
+        import csv
+        from io import StringIO
+
+        results = self.get_pt1_result_summary(
+            session_id, class_id, section_id, subject_id
+        )
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Roll Number", "Admission Number", "Student Name",
+            "Max Marks", "Obtained Marks", "Percentage", "Grade", "Status"
+        ])
+        for r in results:
+            writer.writerow([
+                r["roll_number"],
+                r["admission_number"],
+                r["name"],
+                r["max_marks"],
+                r["obtained_marks"] if r["obtained_marks"] is not None else "",
+                f"{r['percentage']:.2f}" if r["percentage"] is not None else "",
+                r["grade"] if r["grade"] else "",
+                r["status"],
+            ])
+
+        return output.getvalue()
+
+    def get_pt1_subjects_for_class_section(
+        self, class_id: int, section_id: int
+    ) -> List:
+        """Get subjects that have PT1 components for a class+section."""
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        subjects = self.subject_repo.list_active()
+        result = []
+        for subj in subjects:
+            comps = self.component_repo.get_by_exam_type_and_subject(
+                pt1_exam_type.id, subj.id
+            )
+            if comps:
+                result.append(subj)
+        return result
+
+    # ------------------------------------------------------------------ audit
+
+    def _log_audit(
+        self,
+        component_marks: ComponentMarks,
+        field_changed: str,
+        old_value: str | None,
+        new_value: str | None,
+        old_status: str | None,
+        new_status: str | None,
+        action: str,
+        user_id: int | None = None,
+        user_name: str | None = None,
+        component_name: str | None = None,
+        component_code: str | None = None,
+        conversion_applied: bool = False,
+        conversion_formula: str | None = None,
+    ) -> MarksAuditLog:
+        """Create an audit log entry for a component marks change with component-specific details."""
+        audit = MarksAuditLog(
+            marks_id=component_marks.id,
+            student_id=component_marks.student_id,
+            subject_id=component_marks.subject_id,
+            exam_type_id=component_marks.exam_type_id,
+            session_id=component_marks.session_id,
+            class_id=component_marks.class_id,
+            section_id=component_marks.section_id,
+            field_changed=field_changed,
+            old_value=old_value,
+            new_value=new_value,
+            old_status=old_status,
+            new_status=new_status,
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+        )
+        # Add component-specific audit info in the field_changed or as JSON in a custom field
+        # For now, store component-specific info in the field_changed and old/new values
+        if component_marks.component:
+            audit.field_changed = f"{component_marks.component.code}: {field_changed}"
+            if component_name:
+                audit.old_value = f"[{component_name}] {old_value or ''}"
+                audit.new_value = f"[{component_name}] {new_value or ''}"
+        
+        # Store conversion info in old_value/new_value if conversion was applied
+        if conversion_applied and conversion_formula:
+            audit.old_value = f"{audit.old_value or ''} | Conversion: {conversion_formula}"
+        
+        from repositories import MarksAuditLogRepository
+        audit_repo = MarksAuditLogRepository(self.session)
+        audit_repo.add(audit)
+        return audit
+
+        return result
+
+    def export_pt1_results_to_csv(
+        self,
+        session_id: int,
+        class_id: int,
+        section_id: int,
+        subject_id: int,
+    ) -> str:
+        """Export PT1 result summary to CSV format."""
+        import csv
+        from io import StringIO
+
+        results = self.get_pt1_result_summary(
+            session_id, class_id, section_id, subject_id
+        )
+
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Roll Number", "Admission Number", "Student Name",
+            "Max Marks", "Obtained Marks", "Percentage", "Grade", "Status"
+        ])
+        for r in results:
+            writer.writerow([
+                r["roll_number"],
+                r["admission_number"],
+                r["name"],
+                r["max_marks"],
+                r["obtained_marks"] if r["obtained_marks"] is not None else "",
+                f"{r['percentage']:.2f}" if r["percentage"] is not None else "",
+                r["grade"] if r["grade"] else "",
+                r["status"],
+            ])
+
+        return output.getvalue()
+
+    def get_pt1_subjects_for_class_section(
+        self, class_id: int, section_id: int
+    ) -> List:
+        """Get subjects that have PT1 components for a class+section."""
+        pt1_exam_type = self.exam_type_repo.get_by_name("PT1")
+        if not pt1_exam_type:
+            return []
+
+        subjects = self.subject_repo.list_active()
+        result = []
+        for subj in subjects:
+            comps = self.component_repo.get_by_exam_type_and_subject(
+                pt1_exam_type.id, subj.id
+            )
+            if comps:
+                result.append(subj)
+        return result
+
+    # ------------------------------------------------------------------ audit
+
+    def _log_audit(
+        self,
+        component_marks: ComponentMarks,
+        field_changed: str,
+        old_value: str | None,
+        new_value: str | None,
+        old_status: str | None,
+        new_status: str | None,
+        action: str,
+        user_id: int | None = None,
+        user_name: str | None = None,
+        component_name: str | None = None,
+        component_code: str | None = None,
+        conversion_applied: bool = False,
+        conversion_formula: str | None = None,
+    ) -> MarksAuditLog:
+        """Create an audit log entry for a component marks change with component-specific details."""
+        audit = MarksAuditLog(
+            marks_id=component_marks.id,
+            student_id=component_marks.student_id,
+            subject_id=component_marks.subject_id,
+            exam_type_id=component_marks.exam_type_id,
+            session_id=component_marks.session_id,
+            class_id=component_marks.class_id,
+            section_id=component_marks.section_id,
+            field_changed=field_changed,
+            old_value=old_value,
+            new_value=new_value,
+            old_status=old_status,
+            new_status=new_status,
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+        )
+        # Add component-specific audit info in the field_changed or as JSON in a custom field
+        # For now, store component-specific info in the field_changed and old/new values
+        if component_marks.component:
+            audit.field_changed = f"{component_marks.component.code}: {field_changed}"
+            if component_name:
+                audit.old_value = f"[{component_name}] {old_value or ''}"
+                audit.new_value = f"[{component_name}] {new_value or ''}"
+        
+        # Store conversion info in old_value/new_value if conversion was applied
+        if conversion_applied and conversion_formula:
+            audit.old_value = f"{audit.old_value or ''} | Conversion: {conversion_formula}"
+        
+        from repositories import MarksAuditLogRepository
+        audit_repo = MarksAuditLogRepository(self.session)
+        audit_repo.add(audit)
+        return audit
+
+
+# ========================================================================
+# Exam Component Service
+# ========================================================================
+
+class ExamComponentService:
+    def __init__(self, session: Session):
+        self.session = session
+        self.repo = ExamComponentRepository(session)
+
+    def add_component(
+        self,
+        exam_type_id: int,
+        name: str,
+        code: str,
+        max_marks: int,
+        subject_id: int | None = None,
+        display_order: int | None = None,
+        is_active: bool = True,
+    ) -> ExamComponent:
+        name = (name or "").strip()
+        code = (code or "").strip().upper()
+        if not name:
+            raise ValueError("Component name is required")
+        if not code:
+            raise ValueError("Component code is required")
+        if max_marks <= 0:
+            raise ValueError("Max marks must be positive")
+        if self.repo.exists_by_name(exam_type_id, name, subject_id, exclude_id=None):
+            raise ValueError(f"Component '{name}' already exists for this exam type")
+        
+        if display_order is None:
+            existing = self.repo.get_by_exam_type(exam_type_id)
+            display_order = max([c.display_order for c in existing], default=0) + 1
+        
+        component = ExamComponent(
+            exam_type_id=exam_type_id,
+            subject_id=subject_id,
+            name=name,
+            code=code,
+            max_marks=max_marks,
+            display_order=display_order,
+            is_active=is_active,
+        )
+        try:
+            self.repo.add(component)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return component
+
+    def update_component(
+        self,
+        component_id: int,
+        name: Optional[str] = None,
+        code: Optional[str] = None,
+        max_marks: Optional[int] = None,
+        display_order: Optional[int] = None,
+        is_active: Optional[bool] = None,
+    ) -> ExamComponent:
+        component = self.repo.get(component_id)
+        if component is None:
+            raise ValueError("Component not found")
+        
+        if name is not None:
+            name = name.strip()
+            if not name:
+                raise ValueError("Component name is required")
+            if self.repo.exists_by_name(component.exam_type_id, name, component.subject_id, exclude_id=component_id):
+                raise ValueError(f"Component '{name}' already exists")
+            component.name = name
+        
+        if code is not None:
+            code = code.strip().upper()
+            if not code:
+                raise ValueError("Component code is required")
+            component.code = code
+        
+        if max_marks is not None:
+            if max_marks <= 0:
+                raise ValueError("Max marks must be positive")
+            component.max_marks = max_marks
+        
+        if display_order is not None:
+            if display_order < 0:
+                raise ValueError("Display order must be non-negative")
+            component.display_order = display_order
+        
+        if is_active is not None:
+            component.is_active = is_active
+        
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return component
+
+    def delete_component(self, component_id: int) -> bool:
+        component = self.repo.get(component_id)
+        if component is None:
+            raise ValueError("Component not found")
+        try:
+            self.repo.delete(component)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        return True
+
+    def list_components(self, exam_type_id: int) -> List[ExamComponent]:
+        return self.repo.get_by_exam_type(exam_type_id)
+
+    def list_components_for_subject(self, exam_type_id: int, subject_id: int) -> List[ExamComponent]:
+        return self.repo.get_by_exam_type_and_subject(exam_type_id, subject_id)
+
+    def reorder_components(self, exam_type_id: int, component_orders: List[Tuple[int, int]]) -> None:
+        try:
+            for component_id, new_order in component_orders:
+                if new_order < 0:
+                    raise ValueError("Display order must be non-negative")
+                component = self.repo.get(component_id)
+                if component is None:
+                    raise ValueError(f"Component {component_id} not found")
+                component.display_order = new_order
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+
+    def bulk_import(
+        self,
+        exam_type_id: int,
+        subject_id: int | None,
+        components: List[dict],
+        skip_duplicates: bool = True,
+    ) -> Tuple[List[ExamComponent], List[str]]:
+        created = []
+        errors = []
+        for idx, comp in enumerate(components):
+            name = (comp.get("name") or "").strip()
+            code = (comp.get("code") or "").strip().upper()
+            if not name:
+                errors.append(f"Row {idx + 1}: Empty name skipped")
+                continue
+            if not code:
+                errors.append(f"Row {idx + 1} ({name}): Empty code skipped")
+                continue
+            if self.repo.exists_by_name(exam_type_id, name, subject_id):
+                if skip_duplicates:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate skipped")
+                    continue
+                else:
+                    errors.append(f"Row {idx + 1} ({name}): Duplicate")
+                    continue
+            try:
+                c = self.add_component(
+                    exam_type_id=exam_type_id,
+                    name=name,
+                    code=code,
+                    max_marks=comp.get("max_marks", 0),
+                    subject_id=subject_id,
+                    is_active=comp.get("is_active", True),
+                )
+                created.append(c)
+            except Exception as exc:
+                errors.append(f"Row {idx + 1} ({name}): {exc}")
+        return created, errors
+
+    def export_components_to_csv(self, exam_type_id: int, subject_id: int | None = None) -> str:
+        import csv
+        from io import StringIO
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["Name", "Code", "Max Marks", "Display Order", "Active"])
+        for c in self.list_components_for_subject(exam_type_id, subject_id) if subject_id else self.list_components(exam_type_id):
+            writer.writerow([c.name, c.code, c.max_marks, c.display_order, "Yes" if c.is_active else "No"])
+        return output.getvalue()

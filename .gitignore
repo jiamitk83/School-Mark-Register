@@ -1,0 +1,85 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+.venv/
+venv*/
+.venv*/
+
+# Backup Git directories
+.git_backup/
+.git*/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project local database and backups - production data
+**/*.db
+**/*.db.bak
+**/*.bak
+**/data/
+
+# Environment / secrets
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+*.secret
+
+# Logs
+*.log
+logs/
+tmp/
+temp/
+
+# Mypy / type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Screenshots / images
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.bmp
+*.tiff
+
+# Test output / debug files
+*.txt
+!README.md
+!requirements.txt
+!*.py
+
+# Editor / OS temp files
+*.swp
+*~
+
+# Python
+*.pyo
+*.pyd
